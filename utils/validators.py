@@ -1,6 +1,20 @@
 import re
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+
+def _host_matches(host: str, base: str) -> bool:
+    return host == base or host.endswith("." + base)
+
+
+def _is_douyin_web_host(host: str) -> bool:
+    return _host_matches(host, "douyin.com") or _host_matches(host, "iesdouyin.com")
+
+
+def _is_live_replay_path(host: str, path: str) -> bool:
+    if _is_douyin_web_host(host):
+        return path.startswith("/vsdetail/")
+    return host == "webcast.amemv.com" and path.startswith("/douyin/webcast/reflow/episode/")
 
 
 def validate_url(url: str) -> bool:
@@ -68,13 +82,25 @@ def parse_url_type(url: str) -> Optional[str]:
         return "short"
 
     parsed = urlparse(url)
-    host = (parsed.netloc or "").lower()
+    host = (parsed.hostname or "").lower()
     path = parsed.path
 
-    # live.douyin.com/{room_id} — 直播间专用子域，path 仅有一段数字。
-    if host.startswith("live.douyin.com"):
-        return "live"
+    if _is_live_replay_path(host, path):
+        return "live_replay"
 
+    if not _is_douyin_web_host(host):
+        return None
+
+    # modal_id 参数表示在任意页面（用户主页、发现页、搜索页等）弹窗查看单个作品，
+    # 应优先识别为单作品下载，而非该页面本身的类型。
+    qs = parse_qs(parsed.query)
+    modal_ids = qs.get("modal_id", [])
+    if modal_ids and modal_ids[0].strip():
+        return "video"
+
+    # live.douyin.com/{room_id} — 直播间专用子域，path 仅有一段数字。
+    if host == "live.douyin.com":
+        return "live"
     if "/video/" in path:
         return "video"
     if "/user/" in path:

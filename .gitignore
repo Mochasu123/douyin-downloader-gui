@@ -43,6 +43,8 @@ config*.yml
 !config.example.yml
 .cookies.json
 config/cookies.json
+desktop_settings.json
+desktop_self_test.*
 .omx/
 
 # Editor / IDE local settings

@@ -139,6 +139,7 @@ class Database:
 
         await db.commit()
         self._initialized = True
+        await self._auto_vacuum()
 
     async def is_downloaded(self, aweme_id: str) -> bool:
         db = await self._get_conn()
@@ -637,6 +638,26 @@ class Database:
                 }
             )
         return result
+
+    async def _auto_vacuum(self) -> None:
+        """Vacuum the database if the file exceeds 100 MB on disk.
+
+        Long-running instances accumulate free pages from deleted rows
+        (history pruning, batch insert-or-replace).  A periodic vacuum
+        reclaims that space and keeps the file manageable.
+        """
+        import os
+        try:
+            size_mb = os.path.getsize(self.db_path) / (1024 * 1024)
+        except OSError:
+            return
+        if size_mb < 100:
+            return
+        db = await self._get_conn()
+        if self._conn_lock is None:
+            self._conn_lock = asyncio.Lock()
+        async with self._conn_lock:
+            await db.execute("VACUUM")
 
     async def close(self):
         if self._conn is not None:

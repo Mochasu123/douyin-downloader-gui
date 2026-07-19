@@ -1,6 +1,7 @@
+import asyncio
 import os
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Callable, Dict, Optional, Union
 
 import aiofiles
 import aiohttp
@@ -137,6 +138,9 @@ class FileManager:
         *,
         prefer_response_content_type: bool = False,
         return_saved_path: bool = False,
+        progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+        should_pause: Optional[Callable[[], bool]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Union[bool, Path]:
         should_close = False
         if session is None:
@@ -169,8 +173,16 @@ class FileManager:
                     written = 0
                     async with aiofiles.open(tmp_path, "wb") as f:
                         async for chunk in response.content.iter_chunked(8192):
+                            while should_pause and should_pause():
+                                await asyncio.sleep(0.2)
+                            if should_cancel and should_cancel():
+                                logger.info("Download cancelled for %s", final_path.name)
+                                tmp_path.unlink(missing_ok=True)
+                                return False
                             await f.write(chunk)
                             written += len(chunk)
+                            if progress_callback:
+                                progress_callback(written, expected_size)
                     if expected_size is not None and written != expected_size:
                         logger.warning(
                             "Size mismatch for %s: expected %d, got %d",

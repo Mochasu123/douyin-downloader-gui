@@ -31,6 +31,14 @@ class ProgressReporter(Protocol):
 
     def advance_item(self, status: str, detail: str = "") -> None: ...
 
+    def on_file_progress(
+        self, file_name: str, written: int, expected_size: Optional[int]
+    ) -> None: ...
+
+    def should_pause(self) -> bool: ...
+
+    def should_cancel(self) -> bool: ...
+
 
 class DownloadResult:
     def __init__(self):
@@ -107,6 +115,38 @@ class BaseDownloader(ABC):
             self.progress_reporter.advance_item(status, detail)
         except Exception as exc:
             logger.debug("Progress advance_item failed: %s", exc)
+
+    def _progress_file_progress(
+        self, file_name: str, written: int, expected_size: Optional[int]
+    ) -> None:
+        if not self.progress_reporter:
+            return
+        try:
+            fn = getattr(self.progress_reporter, "on_file_progress", None)
+            if callable(fn):
+                fn(file_name, written, expected_size)
+        except Exception as exc:
+            logger.debug("Progress on_file_progress failed: %s", exc)
+
+    def _progress_should_pause(self) -> bool:
+        if not self.progress_reporter:
+            return False
+        try:
+            fn = getattr(self.progress_reporter, "should_pause", None)
+            return bool(fn()) if callable(fn) else False
+        except Exception as exc:
+            logger.debug("Progress should_pause failed: %s", exc)
+            return False
+
+    def _progress_should_cancel(self) -> bool:
+        if not self.progress_reporter:
+            return False
+        try:
+            fn = getattr(self.progress_reporter, "should_cancel", None)
+            return bool(fn()) if callable(fn) else False
+        except Exception as exc:
+            logger.debug("Progress should_cancel failed: %s", exc)
+            return False
 
     def _progress_report_author(
         self,
@@ -521,6 +561,11 @@ class BaseDownloader(ABC):
                 proxy=getattr(self.api_client, "proxy", None),
                 prefer_response_content_type=prefer_response_content_type,
                 return_saved_path=return_saved_path,
+                progress_callback=lambda written, total: self._progress_file_progress(
+                    save_path.name, written, total
+                ),
+                should_pause=self._progress_should_pause,
+                should_cancel=self._progress_should_cancel,
             )
             if not download_result:
                 raise RuntimeError(f"Download failed for {url}")
