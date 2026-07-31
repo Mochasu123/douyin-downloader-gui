@@ -1,19 +1,85 @@
-"""Dual progress bars + status labels."""
+"""Progress area — smooth animated bars, status labels and a state dot."""
 
 import tkinter as tk
 from tkinter import ttk
 
+from gui.theme import FONT_BOLD, TEXT
+from gui.widgets.smooth_progress import SmoothProgressBar
+from gui.widgets.status_dot import StatusDot
+
 
 class ProgressPanel(ttk.Frame):
+    """Two-row panel: total progress + per-file progress.
+
+    Both bars ease toward their target when the bound variables change;
+    the status dot reflects the current state (idle / downloading / done).
+    """
+
     def __init__(self, parent, total_progress_var, file_progress_var,
                  status_var, file_status_var):
-        super().__init__(parent, padding=(12, 0, 12, 8))
-        self.columnconfigure(1, weight=1)
-        self.columnconfigure(3, weight=1)
+        super().__init__(parent, style="Card.TFrame", padding=(14, 10, 14, 12))
+        self.columnconfigure(2, weight=1)
 
-        ttk.Label(self, textvariable=status_var, width=28).grid(row=0, column=0, sticky="w")
-        ttk.Progressbar(self, variable=total_progress_var, maximum=100).grid(
-            row=0, column=1, sticky="ew", padx=(8, 16))
-        ttk.Label(self, textvariable=file_status_var, width=34).grid(row=0, column=2, sticky="w")
-        ttk.Progressbar(self, variable=file_progress_var, maximum=100).grid(
-            row=0, column=3, sticky="ew", padx=(8, 0))
+        self._total_var = total_progress_var
+        self._file_var = file_progress_var
+        self._status_var = status_var
+
+        # ── row 0: total progress ─────────────────────────────────
+        self.dot = StatusDot(self, state="pending", canvas_bg="#FFFFFF")
+        self.dot.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 8))
+
+        ttk.Label(self, textvariable=status_var, width=34, style="Card.TLabel"
+                  ).grid(row=0, column=1, sticky="w")
+
+        self.total_bar = SmoothProgressBar(self, height=10, canvas_bg="#FFFFFF")
+        self.total_bar.grid(row=0, column=2, sticky="ew", padx=(8, 4))
+
+        self.pct_label = ttk.Label(self, text="0%", width=5, style="Card.TLabel",
+                                   foreground="#2563EB", font=FONT_BOLD)
+        self.pct_label.grid(row=0, column=3, sticky="e")
+
+        # ── row 1: file progress ──────────────────────────────────
+        ttk.Label(self, textvariable=file_status_var, width=36,
+                  style="Card.TLabel", foreground=TEXT
+                  ).grid(row=1, column=1, sticky="w")
+
+        self.file_bar = SmoothProgressBar(self, height=10, canvas_bg="#FFFFFF")
+        self.file_bar.grid(row=1, column=2, sticky="ew", padx=(8, 4))
+
+        # ── watch the bound variables ─────────────────────────────
+        total_progress_var.trace_add("write", self._on_total_change)
+        file_progress_var.trace_add("write", self._on_file_change)
+        status_var.trace_add("write", self._on_status_change)
+        self._on_total_change()
+        self._on_status_change()
+
+    # ── internals ──────────────────────────────────────────────────
+
+    def _on_total_change(self, *_):
+        try:
+            value = float(self._total_var.get())
+        except (TypeError, ValueError):
+            value = 0.0
+        self.total_bar.set_value(value)
+        self.pct_label.configure(text="%d%%" % int(round(value)))
+
+    def _on_file_change(self, *_):
+        try:
+            value = float(self._file_var.get())
+        except (TypeError, ValueError):
+            value = 0.0
+        self.file_bar.set_value(value)
+
+    def _on_status_change(self, *_):
+        text = str(self._status_var.get())
+        if "空闲" in text or "已暂停" in text:
+            state = "pending" if "空闲" in text else "skipped"
+        elif "已终止" in text:
+            state = "failed"
+        elif "失败" in text:
+            state = "failed"
+        elif "完成" in text or "成功" in text:
+            state = "success"
+        else:
+            state = "downloading"
+        self.dot.set_state(state)

@@ -3,6 +3,8 @@
 import tkinter as tk
 from tkinter import ttk
 
+from gui.theme import FONT, FONT_SMALL, TEXT_MUTED
+
 
 class PreviewTab(ttk.Frame):
     STATUS_TAGS = {
@@ -40,11 +42,12 @@ class PreviewTab(ttk.Frame):
         self.select_all_var = tk.BooleanVar(value=True)
         tk.Checkbutton(self.filter_bar, text="全选", variable=self.select_all_var,
                        command=self._on_select_all_toggle,
-                       relief="flat", bg="#F5F5F5", activebackground="#F5F5F5",
-                       selectcolor="#F5F5F5").pack(side="left")
+                       relief="flat", bg="#FFFFFF", activebackground="#EFF6FF",
+                       selectcolor="#FFFFFF", fg="#0F172A", font=FONT
+                       ).pack(side="left")
 
-        self.filter_count = ttk.Label(self.filter_bar, text="", foreground="#888",
-                                       font=("Microsoft YaHei UI", 8))
+        self.filter_count = ttk.Label(self.filter_bar, text="", foreground=TEXT_MUTED,
+                                       font=FONT_SMALL)
         self.filter_count.pack(side="left", padx=(12, 0))
 
         # ── Treeview ─────────────────────────────────────────────
@@ -58,9 +61,9 @@ class PreviewTab(ttk.Frame):
             "status": "状态", "aweme_id": "作品 ID",
         }
         widths = {
-            "index": 45, "title": 300, "collection": 80,
-            "publish_time": 150, "duration": 65,
-            "media_type": 55, "size": 70, "status": 105, "aweme_id": 0,
+            "index": 48, "title": 320, "collection": 90,
+            "publish_time": 150, "duration": 70,
+            "media_type": 60, "size": 75, "status": 110, "aweme_id": 0,
         }
         for col in columns:
             self.tree.heading(col, text=headers[col],

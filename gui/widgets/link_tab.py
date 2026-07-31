@@ -3,7 +3,9 @@
 import tkinter as tk
 from tkinter import ttk
 
+from gui.theme import FONT, FONT_SMALL, TEXT_MUTED
 from gui.widgets.preview_tab import PreviewTab
+from gui.widgets.rounded_button import RoundedButton
 
 MODE_KEYS = ["post", "like", "mix", "music", "collect", "collectmix"]
 MODE_SHORT = {
@@ -39,15 +41,19 @@ class LinkTab(ttk.Frame):
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(0, weight=1)
 
-        ttk.Label(top, text="下载链接，一行一个",
-                  font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="下载链接，一行一个", font=FONT
+                  ).grid(row=0, column=0, sticky="w")
 
-        self.urls_text = tk.Text(top, height=5, wrap="word")
-        self.urls_text.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(4, 6))
+        self.urls_text = tk.Text(top, height=6, wrap="word",
+                                 bg="#FFFFFF", fg="#0F172A", font=FONT,
+                                 insertbackground="#2563EB", relief="flat",
+                                 highlightthickness=1, highlightbackground="#E2E8F0",
+                                 highlightcolor="#2563EB", padx=8, pady=6)
+        self.urls_text.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 8))
         self.urls_text.insert("1.0", urls_var.get())
 
-        ttk.Button(top, text="解析链接", command=on_preview,
-                   style="Primary.TButton").grid(row=2, column=1, sticky="e", pady=(0, 4))
+        RoundedButton(top, text="解析链接", command=on_preview,
+                      style="primary").grid(row=2, column=1, sticky="e", pady=(0, 4))
 
         # ── Row 1 – Preview table ────────────────────────────────
         self.preview = PreviewTab(self)
@@ -64,9 +70,10 @@ class LinkTab(ttk.Frame):
         for key in MODE_KEYS[:4]:
             tk.Checkbutton(ctrl_inner, text=MODE_SHORT[key],
                            variable=self.mode_vars[key],
-                           relief="flat", bg="#F5F5F5",
-                           activebackground="#F5F5F5",
-                           selectcolor="#F5F5F5").pack(side="left", padx=(6, 0))
+                           relief="flat", bg="#FFFFFF",
+                           activebackground="#EFF6FF",
+                           selectcolor="#FFFFFF", font=FONT,
+                           fg="#0F172A").pack(side="left", padx=(6, 0))
         ttk.Separator(ctrl_inner, orient="vertical").pack(side="left", padx=(8, 8), fill="y")
         ttk.Label(ctrl_inner, text="数量").pack(side="left")
         self.limit_spin = ttk.Spinbox(ctrl_inner, from_=0, to=999999, textvariable=limit_var, width=7)
@@ -75,39 +82,41 @@ class LinkTab(ttk.Frame):
         ctrl_opts = ttk.Frame(ctrl)
         ctrl_opts.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         tk.Checkbutton(ctrl_opts, text="封面", variable=cover_var,
-                       relief="flat", bg="#F5F5F5", activebackground="#F5F5F5",
-                       selectcolor="#F5F5F5").pack(side="left")
+                       relief="flat", bg="#FFFFFF", activebackground="#EFF6FF",
+                       selectcolor="#FFFFFF", fg="#0F172A", font=FONT).pack(side="left")
         tk.Checkbutton(ctrl_opts, text="音乐", variable=music_var,
-                       relief="flat", bg="#F5F5F5", activebackground="#F5F5F5",
-                       selectcolor="#F5F5F5").pack(side="left", padx=(8, 0))
+                       relief="flat", bg="#FFFFFF", activebackground="#EFF6FF",
+                       selectcolor="#FFFFFF", fg="#0F172A", font=FONT).pack(side="left", padx=(8, 0))
         tk.Checkbutton(ctrl_opts, text="头像", variable=avatar_var,
-                       relief="flat", bg="#F5F5F5", activebackground="#F5F5F5",
-                       selectcolor="#F5F5F5").pack(side="left", padx=(8, 0))
+                       relief="flat", bg="#FFFFFF", activebackground="#EFF6FF",
+                       selectcolor="#FFFFFF", fg="#0F172A", font=FONT).pack(side="left", padx=(8, 0))
         tk.Checkbutton(ctrl_opts, text="JSON", variable=json_var,
-                       relief="flat", bg="#F5F5F5", activebackground="#F5F5F5",
-                       selectcolor="#F5F5F5").pack(side="left", padx=(8, 0))
+                       relief="flat", bg="#FFFFFF", activebackground="#EFF6FF",
+                       selectcolor="#FFFFFF", fg="#0F172A", font=FONT).pack(side="left", padx=(8, 0))
         tk.Checkbutton(ctrl_opts, text="增量", variable=increase_var,
-                       relief="flat", bg="#F5F5F5", activebackground="#F5F5F5",
-                       selectcolor="#F5F5F5").pack(side="left", padx=(8, 0))
+                       relief="flat", bg="#FFFFFF", activebackground="#EFF6FF",
+                       selectcolor="#FFFFFF", fg="#0F172A", font=FONT).pack(side="left", padx=(8, 0))
 
         # ── Row 3 – Bottom bar ───────────────────────────────────
         bar = ttk.Frame(self)
         bar.grid(row=4, column=0, sticky="ew")
         bar.columnconfigure(0, weight=1)
 
-        self.dl_info = ttk.Label(bar, text="", foreground="#888",
-                                  font=("Microsoft YaHei UI", 8))
+        self.dl_info = ttk.Label(bar, text="", foreground=TEXT_MUTED,
+                                  font=FONT_SMALL)
         self.dl_info.grid(row=0, column=0, sticky="w")
 
-        self.pause_btn = ttk.Button(bar, text="⏸ 暂停", command=on_pause, state="disabled")
+        self.pause_btn = RoundedButton(bar, text="⏸ 暂停", command=on_pause,
+                                       style="ghost", state="disabled")
         self.pause_btn.grid(row=0, column=1, padx=(0, 6))
-        self.resume_btn = ttk.Button(bar, text="▶ 继续", command=on_resume, state="disabled")
+        self.resume_btn = RoundedButton(bar, text="▶ 继续", command=on_resume,
+                                        style="ghost", state="disabled")
         self.resume_btn.grid(row=0, column=2, padx=(0, 6))
-        self.run_btn = ttk.Button(bar, text="开始下载", command=self._on_start_wrapper,
-                                   style="Primary.TButton")
+        self.run_btn = RoundedButton(bar, text="开始下载", command=self._on_start_wrapper,
+                                     style="primary")
         self.run_btn.grid(row=0, column=3, padx=(6, 0))
-        self.stop_btn = ttk.Button(bar, text="⏹ 终止", command=on_stop, state="disabled",
-                                    style="Danger.TButton")
+        self.stop_btn = RoundedButton(bar, text="⏹ 终止", command=on_stop,
+                                      style="danger", state="disabled")
         self.stop_btn.grid(row=0, column=4, padx=(6, 0))
 
     # ── public API ──────────────────────────────────────────────────

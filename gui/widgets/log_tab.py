@@ -3,6 +3,8 @@
 import tkinter as tk
 from tkinter import ttk
 
+from gui.theme import FONT_MONO
+
 
 class LogTab(ttk.Frame):
     def __init__(self, parent):
@@ -10,7 +12,11 @@ class LogTab(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        self.text = tk.Text(self, wrap="word", state="disabled", font=("Consolas", 9))
+        self.text = tk.Text(self, wrap="word", state="disabled",
+                            font=FONT_MONO,
+                            bg="#F7F9FC", fg="#0F172A",
+                            insertbackground="#2563EB",
+                            relief="flat", padx=8, pady=6)
         self.text.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
         scroll.grid(row=0, column=1, sticky="ns")

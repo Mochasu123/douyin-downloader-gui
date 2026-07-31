@@ -1,121 +1,188 @@
-"""ttk theme and styling for Douyin Downloader GUI.
+"""ttk theme and styling for Douyin Downloader GUI — modern blue/white.
 
-Applies a modern ``clam``-based theme with Douyin-red accents,
-colour-coded Treeview status tags, and improved spacing.
+Applies a ``clam``-based theme with blue gradient accents, a clean white
+background, colour-coded Treeview status tags, and refined spacing.
 """
 
 from tkinter import ttk
 import tkinter as tk
 
 # ── palette ──────────────────────────────────────────────────────────
-DOUYIN_RED = "#FE2C55"
-DOUYIN_RED_DARK = "#E0244A"
-BG_LIGHT = "#F5F5F5"
-TEXT_DARK = "#1A1A1A"
-TEXT_MUTED = "#888888"
-BORDER = "#D0D0D0"
-SUCCESS_BG = "#E8F5E9"
-SUCCESS_FG = "#2E7D32"
-FAILED_BG = "#FFEBEE"
-FAILED_FG = "#C62828"
-DOWNLOADING_BG = "#E3F2FD"
-DOWNLOADING_FG = "#1565C0"
-SKIPPED_BG = "#F5F5F5"
-SKIPPED_FG = "#9E9E9E"
+# blues
+BLUE = "#2563EB"            # primary
+BLUE_HOVER = "#1D4ED8"      # primary hover (darker)
+BLUE_ACTIVE = "#1E40AF"     # primary pressed
+BLUE_LIGHT = "#3B82F6"      # bright accent
+BLUE_SOFT = "#60A5FA"       # soft accent / gradient end
+BLUE_PALE = "#DBEAFE"       # selection / hover background
+BLUE_TINT = "#EFF6FF"       # panel background (very light blue)
+# neutrals
+BG = "#F8FAFC"              # window background (near-white, cool tint)
+BG_PANEL = "#FFFFFF"
+BG_LOG = "#F7F9FC"
+TEXT = "#0F172A"            # near-black slate
+TEXT_MUTED = "#64748B"
+TEXT_FAINT = "#94A3B8"
+BORDER = "#E2E8F0"
+# status colours
+SUCCESS = "#10B981"
+FAILED = "#EF4444"
+SKIPPED = "#94A3B8"
+DOWNLOADING = "#3B82F6"
+PENDING = "#CBD5E1"
+
+# status tag colours (bg / fg)
+SUCCESS_BG = "#ECFDF5"
+SUCCESS_FG = "#047857"
+FAILED_BG = "#FEF2F2"
+FAILED_FG = "#B91C1C"
+DOWNLOADING_BG = "#EFF6FF"
+DOWNLOADING_FG = "#1D4ED8"
+SKIPPED_BG = "#F8FAFC"
+SKIPPED_FG = "#94A3B8"
 PENDING_BG = "#FFFFFF"
-PENDING_FG = "#616161"
+PENDING_FG = "#475569"
+
+# ── fonts (unified type scale, 10pt base for crisp rendering) ───────
+FONT = ("Microsoft YaHei UI", 10)
+FONT_BOLD = ("Microsoft YaHei UI", 10, "bold")
+FONT_SMALL = ("Microsoft YaHei UI", 9)
+FONT_SMALL_BOLD = ("Microsoft YaHei UI", 9, "bold")
+FONT_SECTION = ("Microsoft YaHei UI", 11, "bold")
+FONT_TITLE = ("Microsoft YaHei UI", 16, "bold")
+FONT_MONO = ("Consolas", 10)
+
+# ── legacy aliases (kept for compatibility with existing imports) ────
+DOUYIN_RED = BLUE
+DOUYIN_RED_DARK = BLUE_HOVER
+BG_LIGHT = BG
+TEXT_DARK = TEXT
+
+
+def lerp_color(c1: str, c2: str, t: float) -> str:
+    """Interpolate between two hex colours ``#rrggbb`` at fraction ``t``."""
+    r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+    r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+    r = round(r1 + (r2 - r1) * t)
+    g = round(g1 + (g2 - g1) * t)
+    b = round(b1 + (b2 - b1) * t)
+    return "#%02x%02x%02x" % (r, g, b)
 
 
 def apply_theme(root: tk.Tk) -> ttk.Style:
-    """Apply the Douyin-branded theme and return the style object."""
+    """Apply the blue/white theme and return the style object."""
+    root.configure(bg=BG)
     style = ttk.Style(root)
     style.theme_use("clam")
 
     # ── global defaults ───────────────────────────────────────────
-    style.configure(".", background=BG_LIGHT, foreground=TEXT_DARK, font=("Microsoft YaHei UI", 9))
-    style.configure("TFrame", background=BG_LIGHT)
-    style.configure("TLabel", background=BG_LIGHT, foreground=TEXT_DARK)
-    style.configure("TButton", padding=(12, 5), relief="flat")
+    style.configure(".", background=BG, foreground=TEXT, font=FONT)
+    style.configure("TFrame", background=BG)
+    style.configure("TLabel", background=BG, foreground=TEXT)
+    style.configure("Card.TFrame", background=BG_PANEL)
+    style.configure("Card.TLabel", background=BG_PANEL, foreground=TEXT)
+    style.configure("LogPanel.TFrame", background=BG_PANEL)
+
+    # ── buttons ───────────────────────────────────────────────────
+    style.configure("TButton", padding=(14, 6), relief="flat", borderwidth=0)
     style.map("TButton",
-              background=[("active", DOUYIN_RED), ("!active", "#E0E0E0")],
-              foreground=[("active", "#FFFFFF"), ("!active", TEXT_DARK)])
+              background=[("active", BLUE_PALE), ("!active", BG_PANEL)],
+              foreground=[("active", BLUE), ("!active", BLUE)],
+              focuscolor=[("focus", BLUE)])
 
-    # ── primary (red) action button ───────────────────────────────
-    style.configure("Primary.TButton", background=DOUYIN_RED, foreground="#FFFFFF",
-                    font=("Microsoft YaHei UI", 9, "bold"))
+    # primary (blue) action button — light blue fill, blue text
+    style.configure("Primary.TButton", background=BLUE_PALE, foreground="#1D4ED8",
+                    font=FONT_BOLD)
     style.map("Primary.TButton",
-              background=[("active", DOUYIN_RED_DARK), ("disabled", "#CCCCCC")],
-              foreground=[("active", "#FFFFFF"), ("disabled", "#999999")])
+              background=[("active", "#BFDBFE"), ("pressed", "#93C5FD"),
+                          ("disabled", "#E2E8F0")],
+              foreground=[("active", "#1D4ED8"), ("pressed", "#1D4ED8"),
+                          ("disabled", "#94A3B8")])
 
-    # ── danger (stop) button ──────────────────────────────────────
-    style.configure("Danger.TButton", background="#EF5350", foreground="#FFFFFF")
+    # danger (stop) button — subtle red text on white
+    style.configure("Danger.TButton", background=BG_PANEL, foreground=FAILED)
     style.map("Danger.TButton",
-              background=[("active", "#D32F2F"), ("disabled", "#CCCCCC")],
-              foreground=[("active", "#FFFFFF"), ("disabled", "#999999")])
+              background=[("active", FAILED_BG), ("pressed", "#FEE2E2"),
+                          ("disabled", "#E2E8F0")],
+              foreground=[("active", FAILED), ("pressed", FAILED),
+                          ("disabled", "#94A3B8")])
 
-    # ── tool button (secondary action) ────────────────────────────
-    style.configure("Tool.TButton", padding=(8, 4))
+    # tool button (secondary action)
+    style.configure("Tool.TButton", padding=(8, 4), background=BG_PANEL,
+                    foreground=TEXT_MUTED)
+    style.map("Tool.TButton",
+              background=[("active", BLUE_TINT), ("!active", BG_PANEL)],
+              foreground=[("active", BLUE), ("!active", TEXT_MUTED)])
 
-    # ── progress bar ──────────────────────────────────────────────
-    style.configure("TProgressbar", troughcolor="#E0E0E0", background=DOUYIN_RED,
+    # ── progress bar (kept for ttk fallbacks; GUI uses SmoothProgressBar) ──
+    style.configure("TProgressbar", troughcolor=BORDER, background=BLUE,
                     thickness=10)
 
-    # ── checkbutton (tk native for correct ✓ indicator) ────────
-    # ttk.Checkbutton uses clam theme's × indicator on Windows;
-    # tk.Checkbutton always shows proper ✓/☐ on all platforms.
-    # Per-widget styling is applied inline (bg=..., relief="flat").
+    # ── checkbutton ───────────────────────────────────────────────
+    # tk.Checkbutton is used for correct ✓ indicator (see widgets); the
+    # ttk style here only covers any stray ttk checkboxes.
+    style.configure("TCheckbutton", background=BG, foreground=TEXT)
 
     # ── entry / combobox / spinbox ────────────────────────────────
-    style.configure("TEntry", fieldbackground="#FFFFFF", borderwidth=1, relief="solid")
-    style.configure("TCombobox", fieldbackground="#FFFFFF", borderwidth=1, relief="solid")
+    style.configure("TEntry", fieldbackground=BG_PANEL, bordercolor=BORDER,
+                    borderwidth=1, relief="solid", padding=2)
+    style.map("TEntry", bordercolor=[("focus", BLUE)], fieldbackground=[("disabled", "#F1F5F9")])
+    style.configure("TCombobox", fieldbackground=BG_PANEL, bordercolor=BORDER,
+                    borderwidth=1, relief="solid", padding=2, arrowcolor=TEXT_MUTED)
+    style.map("TCombobox",
+              fieldbackground=[("readonly", BG_PANEL), ("disabled", "#F1F5F9")],
+              bordercolor=[("focus", BLUE)])
+    style.configure("TSpinbox", fieldbackground=BG_PANEL, bordercolor=BORDER,
+                    borderwidth=1, relief="solid", padding=2)
+    style.map("TSpinbox", bordercolor=[("focus", BLUE)])
 
     # ── notebook (tabs) ───────────────────────────────────────────
-    style.configure("TNotebook", background=BG_LIGHT, borderwidth=0)
-    style.configure("TNotebook.Tab", padding=(16, 6), font=("Microsoft YaHei UI", 9))
+    style.configure("TNotebook", background=BG, borderwidth=0)
+    style.configure("TNotebook.Tab", padding=(20, 9), font=FONT, borderwidth=0)
     style.map("TNotebook.Tab",
-              background=[("selected", "#FFFFFF"), ("!selected", BG_LIGHT)],
-              foreground=[("selected", DOUYIN_RED), ("!selected", TEXT_DARK)])
+              background=[("selected", BG_PANEL), ("!selected", BG)],
+              foreground=[("selected", BLUE), ("!selected", TEXT_MUTED)],
+              focuscolor=[("selected", BG_PANEL)])
 
     # ── treeview (preview / history tables) ───────────────────────
-    style.configure("Treeview", font=("Microsoft YaHei UI", 9), rowheight=32,
-                    fieldbackground="#FFFFFF")
-    style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"),
-                    background="#EEEEEE", foreground=TEXT_DARK, relief="flat",
-                    padding=(6, 4))
-    style.map("Treeview.Heading", background=[("active", "#E0E0E0")])
+    style.configure("Treeview", font=FONT, rowheight=38,
+                    fieldbackground=BG_PANEL, background=BG_PANEL,
+                    foreground=TEXT, bordercolor=BORDER)
+    style.map("Treeview",
+              background=[("selected", BLUE)],
+              foreground=[("selected", "#FFFFFF")])
+    style.configure("Treeview.Heading", font=FONT_BOLD,
+                    background="#F8FAFC", foreground=TEXT_MUTED, relief="flat",
+                    padding=(10, 7))
+    style.map("Treeview.Heading", background=[("active", "#EEF2F7")])
 
     # ── colour-coded row tags ────────────────────────────────────
-    style.configure("Treeview", background="#FFFFFF", foreground=TEXT_DARK)
-
     # Success  – green
     style.configure("row_success.Treeview", background=SUCCESS_BG, foreground=SUCCESS_FG)
     style.map("row_success.Treeview",
-              background=[("selected", DOUYIN_RED)],
-              foreground=[("selected", "#FFFFFF")])
-
+              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
     # Failed   – red
     style.configure("row_failed.Treeview", background=FAILED_BG, foreground=FAILED_FG)
     style.map("row_failed.Treeview",
-              background=[("selected", DOUYIN_RED)],
-              foreground=[("selected", "#FFFFFF")])
-
+              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
     # Downloading – blue
     style.configure("row_downloading.Treeview", background=DOWNLOADING_BG,
                     foreground=DOWNLOADING_FG)
     style.map("row_downloading.Treeview",
-              background=[("selected", DOUYIN_RED)],
-              foreground=[("selected", "#FFFFFF")])
-
+              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
     # Skipped – grey
     style.configure("row_skipped.Treeview", background=SKIPPED_BG, foreground=SKIPPED_FG)
     style.map("row_skipped.Treeview",
-              background=[("selected", DOUYIN_RED)],
-              foreground=[("selected", "#FFFFFF")])
-
+              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
     # Pending – white (default)
     style.configure("row_pending.Treeview", background=PENDING_BG, foreground=PENDING_FG)
     style.map("row_pending.Treeview",
-              background=[("selected", DOUYIN_RED)],
-              foreground=[("selected", "#FFFFFF")])
+              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
+
+    # ── scrollbar / separator ─────────────────────────────────────
+    style.configure("TScrollbar", background="#CBD5E1", troughcolor=BLUE_TINT,
+                    bordercolor=BLUE_TINT, arrowcolor=TEXT_MUTED, relief="flat")
+    style.map("TScrollbar", background=[("active", BLUE_SOFT)])
+    style.configure("TSeparator", background=BORDER)
 
     return style

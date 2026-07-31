@@ -27,16 +27,16 @@ class HistoryTab(ttk.Frame):
 
         ttk.Label(bar, text="作者").pack(side="left")
         self.author_var = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.author_var, width=16).pack(side="left", padx=(4, 12))
+        ttk.Entry(bar, textvariable=self.author_var, width=18).pack(side="left", padx=(4, 12))
 
         ttk.Label(bar, text="类型").pack(side="left")
         self.type_var = tk.StringVar(value="全部")
         ttk.Combobox(bar, textvariable=self.type_var, values=["全部", "视频", "图文", "音乐"],
-                     state="readonly", width=6).pack(side="left", padx=(4, 12))
+                     state="readonly", width=8).pack(side="left", padx=(4, 12))
 
         ttk.Label(bar, text="标题").pack(side="left")
         self.title_var = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.title_var, width=20).pack(side="left", padx=(4, 12))
+        ttk.Entry(bar, textvariable=self.title_var, width=24).pack(side="left", padx=(4, 12))
 
         ttk.Button(bar, text="搜索", command=self._search, style="Tool.TButton").pack(side="left")
         ttk.Button(bar, text="刷新", command=self._refresh, style="Tool.TButton").pack(side="left", padx=(8, 0))
@@ -51,21 +51,30 @@ class HistoryTab(ttk.Frame):
             "type": "类型", "create_time": "发布时间", "download_time": "下载时间",
             "file_path": "文件路径",
         }
+        # Sensible widths: title/file_path absorb extra space; the rest are
+        # fixed-size columns. Users can still drag header separators to
+        # resize any column — minwidth prevents collapsing them fully.
         widths = {
-            "aweme_id": 150, "title": 280, "author": 120,
-            "type": 60, "create_time": 150, "download_time": 150, "file_path": 200,
+            "aweme_id": 110, "title": 300, "author": 110,
+            "type": 60, "create_time": 140, "download_time": 140, "file_path": 240,
         }
+        minwidths = {
+            "aweme_id": 80, "title": 140, "author": 80,
+            "type": 50, "create_time": 120, "download_time": 120, "file_path": 150,
+        }
+        stretch_cols = {"title": True, "file_path": True}
         for col in columns:
             self.tree.heading(col, text=headers[col],
                               command=lambda c=col: self._sort_history(c))
-            self.tree.column(col, width=widths[col], anchor="w")
+            self.tree.column(col, width=widths[col], minwidth=minwidths[col],
+                             anchor="w", stretch=stretch_cols.get(col, False))
         self.tree.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         scroll.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scroll.set)
 
         # Zebra stripe tags
-        self.tree.tag_configure("even", background="#F8F8F8")
+        self.tree.tag_configure("even", background="#F8FAFC")
         self.tree.tag_configure("odd", background="#FFFFFF")
 
         # ── pager ─────────────────────────────────────────────────

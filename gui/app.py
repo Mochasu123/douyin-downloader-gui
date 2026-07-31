@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
-import webbrowser
 from pathlib import Path
 from tkinter import BooleanVar, DoubleVar, IntVar, StringVar, messagebox, ttk
 import tkinter as tk
@@ -13,7 +13,9 @@ from gui.controller import (
     AppController, classify_error, default_download_dir, human_size,
     mode_label, mode_value,
 )
-from gui.theme import apply_theme, TEXT_DARK
+from gui.theme import apply_theme, BG, BLUE, FONT, FONT_SECTION, FONT_SMALL, FONT_TITLE
+from gui.widgets.gradient_header import GradientHeader
+from gui.widgets.rounded_button import RoundedButton
 from gui.widgets.settings_tab import SettingsTab
 from gui.widgets.link_tab import LinkTab
 from gui.widgets.progress import ProgressPanel
@@ -22,7 +24,6 @@ from gui.widgets.history_tab import HistoryTab
 
 
 LOG_PANEL_WIDTH = 300
-LOG_BTN_WIDTH = 28
 
 
 class DouyinApp(tk.Tk):
@@ -81,11 +82,24 @@ class DouyinApp(tk.Tk):
 
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        # ── Top bar: gradient banner + log toggle (entry point) ──
+        top_bar = ttk.Frame(self)
+        top_bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        top_bar.columnconfigure(0, weight=1)
+
+        header = GradientHeader(top_bar, title="抖音下载器",
+                                subtitle="抖音无水印批量下载工具 · 蓝白主题")
+        header.grid(row=0, column=0, sticky="nsew")
+
+        self.log_btn = RoundedButton(top_bar, text="📋 日志", style="ghost",
+                                     height=30, command=self._toggle_log_panel)
+        self.log_btn.grid(row=0, column=1, sticky="e", padx=(0, 16), pady=15)
 
         # ── Main area (left) ─────────────────────────────────────
         main = ttk.Frame(self)
-        main.grid(row=0, column=0, sticky="nsew")
+        main.grid(row=1, column=0, sticky="nsew")
         main.rowconfigure(0, weight=1)
         main.columnconfigure(0, weight=1)
 
@@ -98,7 +112,6 @@ class DouyinApp(tk.Tk):
             self.notebook, self.path_var, self.cookie_var, self.retry_var,
             self.browser_fallback_var,
             on_save=self._on_save, on_open_dir=self._on_open_dir,
-            on_clear_log=self._on_clear_log,
         )
         self.notebook.add(self.settings_tab, text="⚙️ 设置")
 
@@ -128,32 +141,19 @@ class DouyinApp(tk.Tk):
         self._build_log_panel()
 
     def _build_log_panel(self):
-        panel = ttk.Frame(self)
-        panel.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=(8, 8))
+        panel = ttk.Frame(self, style="LogPanel.TFrame")
         panel.grid_propagate(False)
-        panel.configure(width=LOG_BTN_WIDTH)
+        panel.configure(width=LOG_PANEL_WIDTH)
 
-        # Collapsed state: just a vertical toggle button
-        self.log_toggle_btn = tk.Button(panel, text="日\n志", relief="flat", bd=0,
-                                         bg="#E8E8E8", fg="#666",
-                                         font=("Microsoft YaHei UI", 9),
-                                         cursor="hand2", padx=3, pady=8,
-                                         command=self._toggle_log_panel)
-        self.log_toggle_btn.pack(fill="both", expand=True)
-
-        # Expanded content (hidden initially)
-        self._log_expanded_frame = ttk.Frame(panel)
-        hdr = ttk.Frame(self._log_expanded_frame)
+        hdr = ttk.Frame(panel, style="LogPanel.TFrame")
         hdr.pack(fill="x")
-        tk.Button(hdr, text="◀ 收起", relief="flat", bd=0, bg="#EEEEEE", fg=TEXT_DARK,
-                  font=("Microsoft YaHei UI", 8), cursor="hand2",
-                  anchor="w", padx=8, pady=2,
-                  command=self._toggle_log_panel).pack(side="left", fill="x", expand=True)
-        tk.Button(hdr, text="✕ 清空", relief="flat", bd=0, bg="#EEEEEE", fg="#999",
-                  font=("Microsoft YaHei UI", 8), cursor="hand2",
-                  command=self._on_clear_log).pack(side="right", padx=(0, 2))
+        RoundedButton(hdr, text="◀ 收起", style="ghost", height=28,
+                      command=self._toggle_log_panel
+                      ).pack(side="left", fill="x", expand=True)
+        RoundedButton(hdr, text="✕ 清空", style="ghost", height=28,
+                      command=self._on_clear_log).pack(side="right", padx=(0, 2))
 
-        log_frame = ttk.Frame(self._log_expanded_frame)
+        log_frame = ttk.Frame(panel)
         log_frame.pack(fill="both", expand=True)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
@@ -161,18 +161,20 @@ class DouyinApp(tk.Tk):
         self.log_tab.grid(row=0, column=0, sticky="nsew")
 
         self.log_panel = panel
+        # The panel stays hidden until the top-bar toggle is clicked;
+        # _toggle_log_panel() shows it with grid(row=1, column=1).
 
     def _toggle_log_panel(self):
         if self._log_expanded:
-            self._log_expanded_frame.pack_forget()
-            self.log_toggle_btn.pack(fill="both", expand=True)
-            self.log_panel.configure(width=LOG_BTN_WIDTH)
-            self.log_toggle_btn.configure(text="日\n志")
+            self.log_panel.grid_remove()
+            self.log_btn.set_text("📋 日志")
+            self.log_btn.configure(style="ghost")
             self._log_expanded = False
         else:
-            self.log_toggle_btn.pack_forget()
-            self._log_expanded_frame.pack(fill="both", expand=True)
-            self.log_panel.configure(width=LOG_PANEL_WIDTH)
+            self.log_panel.grid(row=1, column=1, sticky="ns",
+                                padx=(0, 8), pady=(0, 10))
+            self.log_btn.set_text("📋 收起日志")
+            self.log_btn.configure(style="primary")
             self._log_expanded = True
 
     # ══════════════════════════════════════════════════════════════
@@ -236,13 +238,17 @@ class DouyinApp(tk.Tk):
     def _on_save(self):
         try:
             self.ctrl.save_config(self._collect_form_values())
+            return True
         except Exception as exc:
             messagebox.showerror("配置错误", str(exc))
+            return False
 
     def _on_open_dir(self):
+        # Windows-native: open the folder straight in Explorer (os.startfile
+        # is Windows-only, which is fine — this app targets Windows).
         path = Path(self.path_var.get() or default_download_dir())
         path.mkdir(parents=True, exist_ok=True)
-        webbrowser.open(path.as_uri())
+        os.startfile(str(path))
 
     def _on_clear_log(self):
         self.log_tab.clear()
@@ -359,6 +365,7 @@ class DouyinApp(tk.Tk):
         wizard.resizable(False, False)
         wizard.transient(self)
         wizard.grab_set()
+        wizard.configure(bg=BG)
 
         pages: list[ttk.Frame] = []
         current_page = [0]
@@ -388,25 +395,25 @@ class DouyinApp(tk.Tk):
 
         hdr = ttk.Frame(wizard, padding=(20, 16))
         hdr.grid(row=0, column=0, sticky="ew")
-        ttk.Label(hdr, text="🎬 抖音下载器", font=("Microsoft YaHei UI", 16, "bold"),
-                  foreground="#FE2C55").pack(anchor="center")
+        ttk.Label(hdr, text="🎬 抖音下载器", font=FONT_TITLE,
+                  foreground=BLUE).pack(anchor="center")
 
         p0 = ttk.Frame(wizard, padding=10)
         ttk.Label(p0, text="欢迎使用抖音无水印批量下载工具！",
-                  font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(20, 0))
+                  font=FONT_SECTION).pack(pady=(20, 0))
         ttk.Label(p0, text="本工具可以帮助你：\n\n"
                   "• 批量下载抖音视频（无水印）\n• 按合集组织下载\n"
                   "• 下载用户主页全部作品\n• 图集、封面、头像等资源\n\n"
                   "首先需要设置下载目录和 Cookie。",
-                  font=("Microsoft YaHei UI", 10), wraplength=440,
+                  font=FONT, wraplength=440,
                   justify="left").pack(pady=(16, 0))
         pages.append(p0)
 
         p1 = ttk.Frame(wizard, padding=10)
         ttk.Label(p1, text="设置下载目录",
-                  font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(20, 0))
+                  font=FONT_SECTION).pack(pady=(20, 0))
         ttk.Label(p1, text="选择下载文件保存的位置：",
-                  font=("Microsoft YaHei UI", 10)).pack(pady=(16, 6))
+                  font=FONT).pack(pady=(16, 6))
         dir_entry = ttk.Entry(p1)
         dir_entry.pack(fill="x")
         dir_entry.insert(0, default_download_dir())
@@ -414,13 +421,13 @@ class DouyinApp(tk.Tk):
 
         p2 = ttk.Frame(wizard, padding=10)
         ttk.Label(p2, text="准备好了！",
-                  font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(20, 0))
+                  font=FONT_SECTION).pack(pady=(20, 0))
         ttk.Label(p2, text="操作指南：\n\n"
                   "1️⃣  在「⚙️ 设置」标签页粘贴 Cookie（浏览器 F12 获取）\n"
                   "2️⃣  在「🔗 链接下载」粘贴抖音链接，自动预览\n"
                   "3️⃣  按合集筛选 → 勾选作品 → 点击「开始下载」\n\n"
                   "下载完成后右下角会弹出通知！",
-                  font=("Microsoft YaHei UI", 10), wraplength=440,
+                  font=FONT, wraplength=440,
                   justify="left").pack(pady=(16, 0))
         pages.append(p2)
 
@@ -446,21 +453,49 @@ class DouyinApp(tk.Tk):
         toast = tk.Toplevel(self)
         toast.overrideredirect(True)
         toast.attributes("-topmost", True)
-        toast.configure(bg="#2E7D32" if failed == 0 else "#E65100")
+        ok = failed == 0
+        accent = BLUE if ok else "#EF4444"
+        toast.configure(bg="#FFFFFF")
+        tk.Frame(toast, bg=accent, height=4).pack(fill="x")
         msg = f"任务完成 — 共 {total} 项，成功 {success}"
         if failed:
             msg += f"，失败 {failed}"
         if skipped:
             msg += f"，跳过 {skipped}"
-        tk.Label(toast, text=msg, bg=toast.cget("bg"), fg="white",
-                 font=("Microsoft YaHei UI", 10), padx=20, pady=12).pack()
+        tk.Label(toast, text=msg, bg="#FFFFFF", fg=accent,
+                 font=("Microsoft YaHei UI", 11, "bold"), padx=26, pady=16).pack()
         toast.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         tw = toast.winfo_width()
         th = toast.winfo_height()
-        toast.geometry(f"+{sw - tw - 30}+{sh - th - 60}")
-        self.after(4000, toast.destroy)
+        base_y = sh - th - 60
+        toast.geometry(f"+{sw - tw - 30}+{base_y + 24}")
+        toast.attributes("-alpha", 0.0)
+
+        # fade in + slide up
+        def _fade_in(step):
+            if step >= 10:
+                toast.attributes("-alpha", 1.0)
+                toast.geometry(f"+{sw - tw - 30}+{base_y}")
+                self.after(3200, _fade_out)
+                return
+            toast.attributes("-alpha", step / 10)
+            y = base_y + int(24 * (1 - step / 10))
+            toast.geometry(f"+{sw - tw - 30}+{y}")
+            self.after(22, lambda: _fade_in(step + 1))
+
+        # fade out before destroying
+        def _fade_out():
+            def _hide(step):
+                if step <= 0:
+                    toast.destroy()
+                    return
+                toast.attributes("-alpha", step / 10)
+                self.after(20, lambda: _hide(step - 1))
+            _hide(10)
+
+        _fade_in(0)
 
     # ══════════════════════════════════════════════════════════════
     # Output drain loop
