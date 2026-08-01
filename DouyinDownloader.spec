@@ -3,7 +3,19 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = [('C:\\Users\\whoca\\anaconda3\\Library\\bin\\tcl86t.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\tk86t.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\sqlite3.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\libbz2.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\ffi.dll', '.')]
+datas += [('C:\\Workspace\\Code Apply\\douyin-downloader\\img', 'img'),
+          ('C:\\Workspace\\Code Apply\\douyin-downloader\\config.example.yml', '.')]
 hiddenimports = ['tkinter', 'cli.main', 'core', 'core.preview_service', 'auth', 'config', 'control', 'storage', 'utils', 'tools', 'server', 'gui', 'gui.app', 'gui.controller', 'gui.theme', 'gui.widgets', 'gui.widgets.settings_tab', 'gui.widgets.link_tab', 'gui.widgets.search_tab', 'gui.widgets.preview_tab', 'gui.widgets.log_tab', 'gui.widgets.progress', 'gui.widgets.history_tab']
+hiddenimports += [
+    'core.comment_media',
+    'core.comment_export',
+    'core.live_photo',
+    'core.live_replay_downloader',
+    'gui.widgets.comments_tab',
+    'gui.widgets.emoji_text',
+    'gui.widgets.history_dialog',
+    'gui.widgets.user_tab',
+]
 tmp_ret = collect_all('aiohttp')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('aiosqlite')
@@ -19,6 +31,12 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pydantic')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('playwright')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('PIL')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('openpyxl')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('imageio_ffmpeg')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
