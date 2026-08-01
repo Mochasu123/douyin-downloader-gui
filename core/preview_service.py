@@ -13,7 +13,11 @@ from core.url_parser import URLParser
 from core.user_downloader import UserDownloader
 from core.user_modes.base_strategy import BaseUserModeStrategy
 from storage import FileManager
-from utils.validators import is_short_url, normalize_short_url
+from utils.validators import extract_url_from_line, is_short_url, normalize_short_url
+
+
+class UnsupportedLinkError(RuntimeError):
+    """链接类型已识别，但当前界面不支持（如直播、直播回放）。"""
 
 
 @dataclass
@@ -37,6 +41,7 @@ class PreviewResult:
     source_type: str
     author_name: str
     items: List[PreviewItem]
+    avatar_url: str = ""
 
 
 class PreviewService:
@@ -64,12 +69,14 @@ class PreviewService:
         await self.api_client.close()
 
     async def preview_url(self, url: str, mode: str = "post") -> PreviewResult:
-        resolved_url = await self._resolve_url(url)
-        parsed = URLParser.parse(resolved_url)
-        if not parsed:
-            raise RuntimeError(f"无法识别链接：{url}")
+        resolved_url, parsed = await self.classify_url(url)
 
         url_type = parsed.get("type")
+        if url_type == "live":
+            raise UnsupportedLinkError("暂不支持直播链接")
+        if url_type == "live_replay":
+            raise UnsupportedLinkError("暂不支持直播回放链接")
+
         if url_type in {"video", "gallery"}:
             aweme_id = str(parsed.get("aweme_id") or "")
             detail = await self.api_client.get_video_detail(aweme_id)
@@ -87,28 +94,24 @@ class PreviewService:
         if url_type == "music":
             return await self._preview_music(resolved_url, parsed)
 
-        if url_type == "live":
-            room_id = str(parsed.get("room_id") or "")
-            item = PreviewItem(
-                aweme_id=room_id,
-                title=f"直播间 {room_id}",
-                publish_time="实时",
-                duration="直播",
-                media_type="直播",
-                author_name="live",
-                author_sec_uid="",
-                size_text="未知",
-                source_type="live",
-                raw={"room_id": room_id, "preview_only": True},
-            )
-            return PreviewResult(resolved_url, url_type, "live", [item])
-
         raise RuntimeError(f"暂不支持预览此链接类型：{url_type}")
+
+    async def classify_url(self, url: str):
+        """解析短链并识别链接类型，返回 (resolved_url, parsed)。"""
+        resolved_url = await self._resolve_url(url)
+        parsed = URLParser.parse(resolved_url)
+        if not parsed:
+            raise RuntimeError(f"无法识别链接：{url}")
+        return resolved_url, parsed
 
     async def _resolve_url(self, url: str) -> str:
         stripped = (url or "").strip()
         if not stripped:
             raise RuntimeError("链接为空")
+        # 兼容“分享文案 + 链接”整行粘贴：只取其中第一个 http(s) 链接
+        extracted = extract_url_from_line(stripped)
+        if extracted:
+            stripped = extracted
         if is_short_url(stripped):
             resolved = await self.api_client.resolve_short_url(normalize_short_url(stripped))
             if not resolved:
@@ -136,7 +139,20 @@ class PreviewService:
             source_type=f"user:{mode}",
             author_name=author_name,
             items=self._dedupe_preview_items(items, author_name, f"user:{mode}"),
+            avatar_url=self._first_url(user_info.get("avatar_larger")),
         )
+
+    @staticmethod
+    def _first_url(source: Any) -> str:
+        if isinstance(source, dict):
+            url_list = source.get("url_list") or source.get("urlList") or []
+            if url_list:
+                return str(url_list[0])
+        elif isinstance(source, list) and source:
+            return str(source[0])
+        elif isinstance(source, str):
+            return source
+        return ""
 
     async def _preview_collection(
         self, source: str, parsed: Dict[str, Any]
@@ -273,4 +289,6 @@ class PreviewService:
             "video": "视频",
             "gallery": "图文",
             "music": "音乐",
+            "live": "直播",
+            "live_replay": "直播回放",
         }.get(media_type, media_type or "未知")

@@ -8,3 +8,6 @@ gmssl>=3.2.2
 # Bundled ffmpeg static binary for audio extraction before
 # transcription upload. Pinned exact for reproducible sidecar builds.
 imageio-ffmpeg==0.6.0
+httpx>=0.25
+pillow>=10.0
+openpyxl>=3.1

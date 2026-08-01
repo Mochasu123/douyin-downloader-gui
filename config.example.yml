@@ -30,6 +30,12 @@ author_dir: "nickname"
 # 默认不下载作者主页置顶作品；如需包含置顶，改为 true
 download_pinned: false
 
+# 图集/评论区动图下载后自动合并为动态照片（华为手机可直接查看）
+live_photo_merge: true
+
+# 下载博主作品时，在作者根目录覆盖保存一张主页首屏截图
+homepage_screenshot: false
+
 mode:
   - post
 
@@ -54,6 +60,14 @@ retry_times: 3
 proxy: ""
 database: true
 database_path: dy_downloader.db
+
+# 视频下载画质。抖音 API 为每个视频返回多档码率，此选项决定选用哪一档：
+#   highest                  - 最高可用档（默认，与历史行为一致）
+#   lowest                   - 最低可用档（省流量）
+#   1440p / 1080p / 720p / 540p / 480p / 360p
+#                            - 指定分辨率，匹配不到时自动降级到最接近的可用档
+# 实际可用档位取决于原视频上传质量。
+video_quality: highest
 
 progress:
   quiet_logs: true

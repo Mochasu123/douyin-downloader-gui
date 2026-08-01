@@ -11,13 +11,15 @@ import tkinter as tk
 
 from gui.controller import (
     AppController, classify_error, default_download_dir, human_size,
-    mode_label, mode_value,
+    mode_label, mode_value, url_type_label, video_quality_label,
 )
 from gui.theme import apply_theme, BG, BLUE, FONT, FONT_SECTION, FONT_SMALL, FONT_TITLE
 from gui.widgets.gradient_header import GradientHeader
 from gui.widgets.rounded_button import RoundedButton
 from gui.widgets.settings_tab import SettingsTab
 from gui.widgets.link_tab import LinkTab
+from gui.widgets.comments_tab import CommentsTab
+from gui.widgets.user_tab import UserTab
 from gui.widgets.progress import ProgressPanel
 from gui.widgets.log_tab import LogTab
 from gui.widgets.history_tab import HistoryTab
@@ -39,16 +41,20 @@ class DouyinApp(tk.Tk):
         self._log_expanded = False
 
         apply_theme(self)
+        self._set_app_icon()
 
         self.ctrl = AppController(project_root, app_config, app_settings, self._log)
         self.ctrl.set_busy_callback(self._set_busy_buttons)
+        self.ctrl.set_user_busy_callback(self._set_user_busy_buttons)
 
         self._init_variables()
+        self._saved_cookie_value = self.cookie_var.get()
         self._build_ui()
         self._restore_window_geometry()
-        self._restore_last_tab()
+        self._select_default_tab()
 
         self._completion_stats: dict = {}
+        self._unsupported_labels: set = set()
         self.after(100, self._drain_output)
         self.after(500, self._check_first_launch)
 
@@ -64,6 +70,12 @@ class DouyinApp(tk.Tk):
         self.json_var = BooleanVar(value=bool(cfg.get("json", True)))
         self.increase_var = BooleanVar(
             value=bool((cfg.get("increase") or {}).get("post", False)))
+        self.homepage_screenshot_var = BooleanVar(
+            value=bool(cfg.get("homepage_screenshot", False)))
+        self.live_photo_merge_var = BooleanVar(
+            value=bool(cfg.get("live_photo_merge", True)))
+        self.video_quality_var = StringVar(
+            value=video_quality_label(cfg.get("video_quality")))
         self.browser_fallback_var = BooleanVar(
             value=bool((cfg.get("browser_fallback") or {}).get("enabled", True)))
 
@@ -76,7 +88,7 @@ class DouyinApp(tk.Tk):
         self.total_progress_var = DoubleVar(value=0)
         self.file_progress_var = DoubleVar(value=0)
         self.status_var = StringVar(value="空闲")
-        self.file_status_var = StringVar(value="当前文件：无")
+        self.file_status_var = StringVar(value="")
 
     # ══════════════════════════════════════════════════════════════
 
@@ -107,28 +119,56 @@ class DouyinApp(tk.Tk):
         self.notebook.grid(row=0, column=0, sticky="nsew", padx=(12, 0), pady=(8, 0))
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        # Tab 1: Settings
-        self.settings_tab = SettingsTab(
-            self.notebook, self.path_var, self.cookie_var, self.retry_var,
-            self.browser_fallback_var,
-            on_save=self._on_save, on_open_dir=self._on_open_dir,
-        )
-        self.notebook.add(self.settings_tab, text="⚙️ 设置")
-
-        # Tab 2: Link download
+        # Tab 1: Link download
         self.link_tab = LinkTab(
-            self.notebook, self.urls_var, self.limit_var,
-            self.cover_var, self.music_var, self.avatar_var, self.json_var,
-            self.increase_var,
+            self.notebook, self.urls_var,
             on_preview=self._on_link_preview, on_start=self._on_link_start,
             on_pause=self._on_pause, on_resume=self._on_resume, on_stop=self._on_stop,
+            on_history=self._on_link_history,
         )
         self.notebook.add(self.link_tab, text="🔗 链接下载")
 
-        # Tab 3: History
+        # Tab 2: User homepage (sub-mode operations)
+        self.user_tab = UserTab(
+            self.notebook,
+            on_load=self._on_user_load,
+            on_start=self._on_user_start,
+            on_pause=self._on_pause,
+            on_resume=self._on_resume,
+            on_stop=self._on_stop,
+            on_history=self._on_user_history,
+        )
+        self.notebook.add(self.user_tab, text="👤 用户主页")
+
+        # Tab 3: Comments (enabled only for a single video/gallery preview)
+        self.comments_tab = CommentsTab(
+            self.notebook,
+            on_load=lambda: self.ctrl.start_comments_load(
+                self.comments_tab.get_aweme_id()),
+            on_download=lambda images, save_dir: (
+                self.ctrl.start_comment_image_download(images, save_dir)),
+            on_zoom=lambda key, cid, idx: (
+                self.ctrl.start_comment_zoom(key, cid, idx)),
+            on_open_dir=self._on_open_comments_dir,
+        )
+        self.notebook.add(self.comments_tab, text="💬 评论")
+        self.notebook.tab(self.comments_tab, state="disabled")
+
+        # Tab 4: History
         db_path = str(self.project_root / "dy_downloader.db")
         self.history_tab = HistoryTab(self.notebook, db_path)
         self.notebook.add(self.history_tab, text="📋 下载记录")
+
+        # Tab 5: Settings (last, after configuration is done)
+        self.settings_tab = SettingsTab(
+            self.notebook, self.path_var, self.cookie_var, self.retry_var,
+            self.browser_fallback_var, self.video_quality_var,
+            self.cover_var, self.music_var, self.avatar_var, self.json_var,
+            self.increase_var, self.homepage_screenshot_var,
+            self.live_photo_merge_var,
+            on_save=self._on_save, on_open_dir=self._on_open_dir,
+        )
+        self.notebook.add(self.settings_tab, text="⚙️ 设置")
 
         # Progress bar (inside main)
         self.progress = ProgressPanel(
@@ -185,33 +225,31 @@ class DouyinApp(tk.Tk):
         tab = self.notebook.tab(self.notebook.select(), "text")
         if tab == "📋 下载记录":
             self.history_tab.load_page()
-        self._save_last_tab()
+        if tab == "💬 评论":
+            self.comments_tab.refresh_view()
+        self._save_window_geometry()
 
-    def _save_last_tab(self):
+    def _save_window_geometry(self):
         try:
-            idx = self.notebook.index(self.notebook.select())
             data = {}
             if self.app_settings.exists():
                 data = json.loads(self.app_settings.read_text(encoding="utf-8"))
-            data["last_tab"] = idx
             data["window_geometry"] = self.geometry()
             self.app_settings.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                          encoding="utf-8")
         except Exception:
             pass
 
-    def _restore_last_tab(self):
+    def _select_default_tab(self):
+        """已配置时默认进入第一个页签（链接下载）；未配置时进入设置页。"""
         try:
-            if not self.app_settings.exists():
-                return
-            data = json.loads(self.app_settings.read_text(encoding="utf-8"))
-            idx = data.get("last_tab", None)
-            # If cookies exist, default to link tab (index 1), otherwise settings (index 0)
-            if idx is None:
-                cookie_file = self.project_root / ".cookies.json"
-                idx = 1 if (cookie_file.exists() and
-                            json.loads(cookie_file.read_text(encoding="utf-8"))) else 0
-            self.notebook.select(max(0, min(idx, len(self.notebook.tabs()) - 1)))
+            configured = bool(self.cookie_var.get().strip())
+            if configured:
+                self.notebook.select(self.link_tab)
+                self.status_var.set("已配置，可直接使用")
+                self._log("Cookie 已配置，可直接开始下载。\n")
+            else:
+                self.notebook.select(self.settings_tab)
         except Exception:
             pass
 
@@ -232,12 +270,24 @@ class DouyinApp(tk.Tk):
             "avatar": self.avatar_var.get(),
             "json": self.json_var.get(),
             "increase": self.increase_var.get(),
+            "homepage_screenshot": self.homepage_screenshot_var.get(),
+            "live_photo_merge": self.live_photo_merge_var.get(),
+            "video_quality": self.video_quality_var.get(),
             "browser_fallback": self.browser_fallback_var.get(),
         }
 
     def _on_save(self):
         try:
             self.ctrl.save_config(self._collect_form_values())
+            cookie = self.cookie_var.get().strip()
+            cookie_changed = cookie != self._saved_cookie_value
+            self._saved_cookie_value = cookie
+            if cookie and cookie_changed:
+                self._log("Cookie 已保存并生效。\n")
+                messagebox.showinfo(
+                    "配置完成",
+                    "Cookie 已配置成功。重启应用后将默认进入「链接下载」页，"
+                    "不再停留在设置页。")
             return True
         except Exception as exc:
             messagebox.showerror("配置错误", str(exc))
@@ -249,6 +299,12 @@ class DouyinApp(tk.Tk):
         path = Path(self.path_var.get() or default_download_dir())
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(str(path))
+
+    def _on_open_comments_dir(self):
+        path = (self.comments_tab.get_save_dir()
+                or self.path_var.get() or default_download_dir())
+        Path(path).mkdir(parents=True, exist_ok=True)
+        os.startfile(path)
 
     def _on_clear_log(self):
         self.log_tab.clear()
@@ -274,9 +330,14 @@ class DouyinApp(tk.Tk):
     def _set_busy_buttons(self, busy: bool):
         self.link_tab.set_busy(busy)
 
+    def _set_user_busy_buttons(self, busy: bool):
+        self.user_tab.set_busy(busy)
+
     def _on_link_preview(self):
         if self.ctrl.worker and self.ctrl.worker.is_alive():
             return
+        self._unsupported_labels.clear()
+        self.link_tab.set_type_label("")
         form = self._collect_form_values()
         if not form["links"]:
             return
@@ -287,9 +348,13 @@ class DouyinApp(tk.Tk):
         if not form["cookie"]:
             self._log("提示：Cookie 为空，可能无法获取作品信息。\n")
         self.link_tab.preview.clear()
+        self.comments_tab.reset()
+        self.notebook.tab(self.comments_tab, state="disabled")
         self.total_progress_var.set(0)
         self.status_var.set("解析中")
-        self.file_status_var.set("当前文件：无")
+        self.file_status_var.set("")
+        self.file_progress_var.set(0)
+        self.progress.set_progress_visible(False)
         self._set_busy_buttons(True)
         mode = (form["modes"] or ["post"])[0]
         try:
@@ -297,6 +362,58 @@ class DouyinApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("错误", classify_error(exc))
             self._set_busy_buttons(False)
+
+    def _on_user_load(self):
+        if self.ctrl.user_worker and self.ctrl.user_worker.is_alive():
+            return
+        sec_uid = self.user_tab.get_sec_uid()
+        if not sec_uid:
+            messagebox.showwarning(
+                "缺少链接", "请粘贴用户主页链接，例如 https://www.douyin.com/user/xxxx")
+            return
+        form = self._collect_form_values()
+        form["modes"] = [self.user_tab.get_selected_mode()]
+        form["limit"] = self.user_tab.get_limit()
+        form["increase"] = self.user_tab.get_increase()
+        form["links"] = [self.user_tab.get_url()]
+        form["sec_uid"] = sec_uid
+        try:
+            self.ctrl.save_config(form)
+        except Exception:
+            pass
+        self.user_tab.reset()
+        self.user_tab.set_busy(True)
+        self.total_progress_var.set(0)
+        self.file_status_var.set("")
+        self.file_progress_var.set(0)
+        self.progress.set_progress_visible(False)
+        self.status_var.set("加载用户作品中")
+        try:
+            self.ctrl.start_user_preview(form)
+        except Exception as exc:
+            messagebox.showerror("错误", classify_error(exc))
+            self.user_tab.set_busy(False)
+
+    def _on_user_start(self):
+        if self.ctrl.user_worker and self.ctrl.user_worker.is_alive():
+            messagebox.showinfo("正在下载", "当前任务还在运行。")
+            return
+        if not self.user_tab.get_sec_uid():
+            messagebox.showwarning("缺少链接", "请先粘贴用户主页链接并加载作品。")
+            return
+        form = self._collect_form_values()
+        form["modes"] = [self.user_tab.get_selected_mode()]
+        form["limit"] = self.user_tab.get_limit()
+        form["increase"] = self.user_tab.get_increase()
+        form["links"] = [self.user_tab.get_url()]
+        form["sec_uid"] = self.user_tab.get_sec_uid()
+        selected = self._selected_items(self.user_tab.preview)
+        self.user_tab.set_busy(True)
+        self.status_var.set("开始下载")
+        self.file_status_var.set("当前文件：无")
+        self.file_progress_var.set(0)
+        self.progress.set_progress_visible(True)
+        self.ctrl.start_user_download(form, selected)
 
     def _on_link_start(self):
         if self.ctrl.worker and self.ctrl.worker.is_alive():
@@ -313,9 +430,51 @@ class DouyinApp(tk.Tk):
         self.total_progress_var.set(0)
         self.status_var.set("开始下载")
         self.file_status_var.set("当前文件：无")
+        self.progress.set_progress_visible(True)
         self._set_busy_buttons(True)
         selected = self._selected_items(self.link_tab.preview)
         self.ctrl.start_download(form, selected)
+
+    # ── 历史链接 / 历史用户 ─────────────────────────────────────────
+
+    def _on_link_history(self):
+        from gui.widgets.history_dialog import LinkHistoryDialog
+
+        rows = self.ctrl.fetch_link_history()
+        dialog = LinkHistoryDialog(
+            self, rows,
+            on_pick=lambda url: self._use_link_history(dialog, url),
+            fetch_rows=self.ctrl.fetch_link_history,
+            on_delete=self.ctrl.delete_history_entries,
+            on_clear=lambda: self.ctrl.clear_history_kinds(
+                ["video", "gallery", "collection", "music"]),
+        )
+
+    def _use_link_history(self, dialog, url: str):
+        text = self.link_tab.urls_text
+        existing = text.get("1.0", "end").strip()
+        if existing:
+            text.insert("end", "\n" + url)
+        else:
+            text.insert("1.0", url)
+        dialog.destroy()
+
+    def _on_user_history(self):
+        from gui.widgets.history_dialog import UserHistoryDialog
+
+        rows = self.ctrl.fetch_user_history()
+        dialog = UserHistoryDialog(
+            self, rows,
+            avatar_dir=str(self.project_root / "cache" / "avatars"),
+            on_pick=lambda url: self._use_user_history(dialog, url),
+            fetch_rows=self.ctrl.fetch_user_history,
+            on_delete=self.ctrl.delete_history_entries,
+            on_clear=lambda: self.ctrl.clear_history_kinds(["user"]),
+        )
+
+    def _use_user_history(self, dialog, url: str):
+        self.user_tab.set_url(url)
+        dialog.destroy()
 
     def _selected_items(self, preview) -> list:
         selected_iids = preview.get_selected_iids()
@@ -337,6 +496,25 @@ class DouyinApp(tk.Tk):
                 self.geometry(geom)
         except Exception:
             pass
+
+    def _set_app_icon(self):
+        ico = self.project_root / "img" / "app_icon.ico"
+        try:
+            if ico.exists():
+                self.iconbitmap(str(ico))
+                return
+        except Exception:
+            pass
+        png = self.project_root / "img" / "logo.png"
+        if png.exists():
+            try:
+                from PIL import ImageTk
+
+                photo = ImageTk.PhotoImage(file=str(png))
+                self._app_icon_photo = photo
+                self.iconphoto(True, photo)
+            except Exception:
+                pass
 
     def _load_saved_cookie(self):
         cookie_json = self.project_root / ".cookies.json"
@@ -507,6 +685,8 @@ class DouyinApp(tk.Tk):
                 item = self.ctrl.output_queue.get_nowait()
                 if isinstance(item, tuple) and item[0] == "__DONE__":
                     self._set_busy_buttons(False)
+                    self._set_user_busy_buttons(False)
+                    self.progress.set_progress_visible(False)
                     if self.ctrl.cancel_event.is_set():
                         self.status_var.set("已终止")
                     elif self.status_var.get() not in {"解析完成", "任务完成"}:
@@ -529,10 +709,44 @@ class DouyinApp(tk.Tk):
                     iid = f"row_{len(self.ctrl.preview_items)}"
                     self.ctrl.preview_item_by_iid[iid] = item[1]
                     self.link_tab.preview.add_item(item[1], len(self.ctrl.preview_items))
+                elif isinstance(item, tuple) and item[0] == "__URL_TYPE__":
+                    self.link_tab.set_type_label(str(item[1]))
+                elif isinstance(item, tuple) and item[0] == "__LIVE_UNSUPPORTED__":
+                    self._unsupported_labels.add(str(item[1]))
+                elif isinstance(item, tuple) and item[0] == "__USER_URL__":
+                    _, sec_uid = item
+                    self.user_tab.set_url(f"https://www.douyin.com/user/{sec_uid}")
+                    self.notebook.select(self.user_tab)
+                    self._log(f"用户主页链接已转入「用户主页」页签（{sec_uid}）\n")
+                    self.status_var.set("请在「用户主页」页签选择下载内容并加载作品")
+                elif isinstance(item, tuple) and item[0] == "__USER_PREVIEW_ITEM__":
+                    self.ctrl.user_preview_items.append(item[1])
+                    iid = f"user_row_{len(self.ctrl.user_preview_items)}"
+                    self.ctrl.user_preview_item_by_iid[iid] = item[1]
+                    self.user_tab.preview.add_item(item[1], len(self.ctrl.user_preview_items))
+                elif isinstance(item, tuple) and item[0] == "__USER_PREVIEW_DONE__":
+                    self.user_tab.finish_load(int(item[1] or 0))
+                    self.status_var.set("用户作品加载完成")
+                    self.total_progress_var.set(0)
+                    self.progress.set_progress_visible(False)
+                elif isinstance(item, tuple) and item[0] == "__USER_BUSY__":
+                    self.user_tab.set_busy(bool(item[1]))
+                elif isinstance(item, tuple) and item[0] == "__USER_ROW_STATUS_BY_ID__":
+                    _, aweme_id, status, size_text = item
+                    self.user_tab.preview.update_status(
+                        str(aweme_id), str(status), size_text)
                 elif isinstance(item, tuple) and item[0] == "__PREVIEW_DONE__":
                     count = int(item[1] or 0)
+                    if self._unsupported_labels:
+                        labels = "、".join(sorted(self._unsupported_labels))
+                        self._unsupported_labels.clear()
+                        messagebox.showwarning(
+                            "暂不支持",
+                            f"检测到：{labels}\n\n直播/直播回放链接暂不支持下载，"
+                            "请移除相关链接后重试。")
                     self.status_var.set("解析完成")
                     self.total_progress_var.set(0)
+                    self.progress.set_progress_visible(False)
                     self._log(f"完成，共 {count} 个作品。\n")
                     collections: list[str] = []
                     seen: set[str] = set()
@@ -545,18 +759,41 @@ class DouyinApp(tk.Tk):
                     items = self.ctrl.preview_items
                     if items:
                         source = getattr(items[0], "source_type", "")
-                        is_single = source in ("video", "gallery", "music", "live", "collection")
+                        is_single = (
+                            source == "单个作品"
+                            or source in ("video", "gallery", "music", "live", "collection")
+                        )
                         self.link_tab.set_limit_disabled(is_single)
                         if is_single:
                             self.limit_var.set(0)
                     self.link_tab.update_download_count()
                     self.link_tab.preview.tree.bind("<<TreeviewSelect>>",
                                                      lambda _: self.link_tab.update_download_count())
+                    # 单个作品（视频/图文）时启用评论页签
+                    self.comments_tab.reset()
+                    self.notebook.tab(self.comments_tab, state="disabled")
+                    if len(self.ctrl.preview_items) == 1:
+                        single = self.ctrl.preview_items[0]
+                        media_type = getattr(single, "media_type", "") or ""
+                        if media_type in ("视频", "图文"):
+                            save_dir = str(
+                                Path(self.path_var.get() or default_download_dir())
+                                / "评论图片"
+                                / f"{getattr(single, 'author_name', 'unknown') or 'unknown'}_{single.aweme_id}"
+                            )
+                            self.comments_tab.set_aweme(
+                                single.aweme_id,
+                                getattr(single, "title", "") or "",
+                                getattr(single, "author_name", "") or "",
+                                save_dir,
+                            )
+                            self.notebook.tab(self.comments_tab, state="normal")
                 elif isinstance(item, tuple) and item[0] == "__ROW_STATUS_BY_ID__":
                     _, aweme_id, status, size_text = item
                     self.link_tab.preview.update_status(str(aweme_id), str(status), size_text)
                 elif isinstance(item, tuple) and item[0] == "__TOTAL_PROGRESS__":
                     _, completed, total, success, failed, skipped = item
+                    self.progress.set_progress_visible(True)
                     self._completion_stats = {
                         "success": success, "failed": failed, "skipped": skipped,
                         "completed": completed, "total": total,
@@ -574,6 +811,29 @@ class DouyinApp(tk.Tk):
                     else:
                         self.file_progress_var.set(0)
                         self.file_status_var.set(f"{file_name}：{human_size(int(written))}")
+                elif isinstance(item, tuple) and item[0] == "__COMMENT_ITEM__":
+                    self.comments_tab.add_comment(item[1])
+                elif isinstance(item, tuple) and item[0] == "__COMMENT_THUMB__":
+                    _, cid, index, path, is_live, nickname = item
+                    self.comments_tab.add_image(cid, index, path, is_live, nickname)
+                elif isinstance(item, tuple) and item[0] == "__COMMENT_BUSY__":
+                    self.comments_tab.set_busy(bool(item[1]))
+                elif isinstance(item, tuple) and item[0] == "__COMMENTS_DONE__":
+                    _, count, image_count, failed_thumbs = item
+                    self.comments_tab.finish_load(count, image_count, failed_thumbs)
+                elif isinstance(item, tuple) and item[0] == "__COMMENTS_ERROR__":
+                    self.comments_tab.show_load_error(str(item[1]))
+                    self.status_var.set("评论加载失败")
+                elif isinstance(item, tuple) and item[0] == "__COMMENT_DL_PROGRESS__":
+                    _, current, total, success, failed, name = item
+                    self.comments_tab.update_download_progress(
+                        current, total, success, failed, name)
+                elif isinstance(item, tuple) and item[0] == "__COMMENT_DL_DONE__":
+                    _, success, failed, save_dir = item
+                    self.comments_tab.finish_download(success, failed, save_dir)
+                elif isinstance(item, tuple) and item[0] == "__COMMENT_ZOOM__":
+                    _, ok, path, error = item
+                    self.comments_tab.show_zoom_result(ok, path, error)
                 elif isinstance(item, str):
                     self._log(item)
         except queue.Empty:

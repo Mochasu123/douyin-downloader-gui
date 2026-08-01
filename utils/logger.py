@@ -1,5 +1,6 @@
 import logging
 import sys
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from pathlib import Path
 
 _APP_LOGGER_PREFIX = "dy-downloader"
@@ -50,3 +51,19 @@ def set_console_log_level(level: int) -> None:
                 handler, logging.FileHandler
             ):
                 handler.setLevel(level)
+
+
+def safe_log_url(value: object) -> str:
+    """Keep URL routing context while removing credentials and query values."""
+
+    text = str(value or "").strip()
+    try:
+        parsed = urlsplit(text)
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        clean = urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+        query_keys = sorted({key for key, _value in parse_qsl(parsed.query, keep_blank_values=True)})
+    except (TypeError, ValueError):
+        return text.split("?", 1)[0].split("#", 1)[0]
+    if not query_keys:
+        return clean
+    return f"{clean}?[query_keys={','.join(query_keys)}]"

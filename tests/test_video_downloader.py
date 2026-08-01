@@ -101,6 +101,52 @@ async def test_video_downloader_reports_item_progress(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_video_downloader_downloads_note_video_fallback(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(music=False, cover=False, avatar=False, json=False, folderstyle=True)
+
+    aweme_id = "7646971177114611826"
+
+    async def _fake_should_download(self, _aweme_id):
+        return True
+
+    async def _fake_get_video_detail(_aweme_id: str):
+        assert _aweme_id == aweme_id
+        return {
+            "aweme_id": aweme_id,
+            "aweme_type": 68,
+            "desc": "note 视频作品",
+            "video": {
+                "play_addr_h264": {"url_list": ["https://v3-web.douyinvod.com/note-h264.mp4"]}
+            },
+        }
+
+    async def _fake_get_session():
+        return object()
+
+    saved = []
+
+    async def _fake_download_with_retry(self, url, save_path, _session, **_kwargs):
+        saved.append((url, save_path))
+        return True
+
+    downloader._should_download = _fake_should_download.__get__(downloader, VideoDownloader)
+    monkeypatch.setattr(api_client, "get_video_detail", _fake_get_video_detail)
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    result = await downloader.download({"type": "gallery", "aweme_id": aweme_id})
+
+    assert result.total == 1
+    assert result.success == 1
+    assert result.failed == 0
+    assert saved[0][0] == "https://v3-web.douyinvod.com/note-h264.mp4"
+    assert saved[0][1].suffix == ".mp4"
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
 async def test_build_no_watermark_url_signs_with_headers(tmp_path, monkeypatch):
     downloader, api_client = _build_downloader(tmp_path)
 
@@ -158,6 +204,251 @@ async def test_build_no_watermark_url_avoids_playwm_when_uri_can_be_signed(tmp_p
 
     assert url == signed_url
     assert headers["User-Agent"] == "UnitTestAgent/2.0"
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_build_no_watermark_url_prefers_signed_uri_when_variant_exists(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    signed_url = "https://www.douyin.com/aweme/v1/play/?video_id=clean&watermark=0"
+
+    def _fake_build_signed_path(path, params):
+        assert path == "/aweme/v1/play/"
+        assert params["video_id"] == "clean"
+        return signed_url, "UnitTestAgent/2.1"
+
+    monkeypatch.setattr(api_client, "build_signed_path", _fake_build_signed_path)
+
+    aweme = {
+        "aweme_id": "1",
+        "video": {
+            "play_addr_h264": {"url_list": ["https://v3-web.douyinvod.com/direct-h264.mp4"]},
+            "play_addr": {
+                "uri": "clean",
+                "url_list": ["https://v3-web.douyinvod.com/playwm/abc.mp4?watermark=1"],
+            },
+        },
+    }
+
+    url, headers = downloader._build_no_watermark_url(aweme)
+
+    assert url == signed_url
+    assert headers["User-Agent"] == "UnitTestAgent/2.1"
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_gallery_mirrors_are_single_attempt_each(tmp_path, monkeypatch):
+    """图集镜像沿用 _download_first_available 的原则：多镜像时镜像列表本身
+    就是重试机制（每镜像单次尝试、早期失败降噪），单镜像才保留退避重试。
+    否则死镜像 × 每镜像 4 次退避嵌套，一张图最坏能拖 3-7 分钟。"""
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(music=False, cover=False, avatar=False, json=False, folderstyle=True)
+
+    aweme_id = "7646971177114611827"
+
+    async def _fake_should_download(self, _aweme_id):
+        return True
+
+    async def _fake_get_video_detail(_aweme_id: str):
+        return {
+            "aweme_id": aweme_id,
+            "aweme_type": 68,
+            "desc": "图集作品",
+            "images": [
+                {
+                    "url_list": [
+                        "https://p3-sign.douyinpic.com/a-mirror1.jpeg",
+                        "https://p9-sign.douyinpic.com/a-mirror2.jpeg",
+                    ]
+                },
+                {"url_list": ["https://p3-sign.douyinpic.com/b-single.jpeg"]},
+            ],
+        }
+
+    async def _fake_get_session():
+        return object()
+
+    calls = []
+
+    async def _fake_download_with_retry(self, url, save_path, _session, **kwargs):
+        calls.append((url, kwargs))
+        return "a-mirror1" not in url  # 首个镜像失败，其余成功
+
+    downloader._should_download = _fake_should_download.__get__(downloader, VideoDownloader)
+    monkeypatch.setattr(api_client, "get_video_detail", _fake_get_video_detail)
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    result = await downloader.download({"type": "gallery", "aweme_id": aweme_id})
+
+    assert result.success == 1
+    by_url = {url: kwargs for url, kwargs in calls}
+    kwargs_multi_1 = by_url["https://p3-sign.douyinpic.com/a-mirror1.jpeg"]
+    assert kwargs_multi_1.get("retry") is False
+    assert kwargs_multi_1.get("optional") is True  # 非末位镜像失败降噪
+    kwargs_multi_2 = by_url["https://p9-sign.douyinpic.com/a-mirror2.jpeg"]
+    assert kwargs_multi_2.get("retry") is False
+    kwargs_single = by_url["https://p3-sign.douyinpic.com/b-single.jpeg"]
+    assert kwargs_single.get("retry", True) is True  # 单镜像保留退避
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_build_no_watermark_url_prefers_direct_cdn_over_inlist_play(tmp_path):
+    """url_list 同时含直连 CDN 与已签名 /aweme/v1/play/ 时必须选直连：
+    play 端点 302 后可能落到打不通的 PCDN 节点（*.qtaeixd.com 高位端口），
+    直连域名走标准 CDN。此前循环内对 douyin.com 候选提前 return，
+    打破了 commit 099aae5 声明的直连优先。"""
+    downloader, api_client = _build_downloader(tmp_path)
+
+    aweme = {
+        "aweme_id": "1",
+        "video": {
+            "play_addr": {
+                "uri": "clean",
+                "url_list": [
+                    "https://www.douyin.com/aweme/v1/play/?video_id=clean&file_id=f"
+                    "&sign=s&is_play_url=1&X-Bogus=abc",
+                    "https://v3-web.douyinvod.com/direct.mp4",
+                ],
+            }
+        },
+    }
+
+    url, _headers = downloader._build_no_watermark_url(aweme)
+
+    assert url == "https://v3-web.douyinvod.com/direct.mp4"
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_build_video_url_candidates_keeps_play_as_fallback(tmp_path):
+    """直连 CDN 之外要保留 play 端点作为降级候选，直连失败时还有救。"""
+    downloader, api_client = _build_downloader(tmp_path)
+
+    play_url = (
+        "https://www.douyin.com/aweme/v1/play/?video_id=clean&file_id=f"
+        "&sign=s&is_play_url=1&X-Bogus=abc"
+    )
+    aweme = {
+        "aweme_id": "1",
+        "video": {
+            "play_addr": {
+                "uri": "clean",
+                "url_list": [play_url, "https://v3-web.douyinvod.com/direct.mp4"],
+            }
+        },
+    }
+
+    candidates = downloader._build_video_url_candidates(aweme)
+
+    assert [url for url, _ in candidates] == [
+        "https://v3-web.douyinvod.com/direct.mp4",
+        play_url,
+    ]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_build_video_url_candidates_includes_all_direct_mirrors(tmp_path):
+    """url_list 常带 2-3 个直连镜像（v3/v9 等不同主机）；只取第一个会在
+    镜像 1 挂掉时直接进 play 端点的 PCDN 抽签，健康的镜像 2 反而被丢弃。
+    全部净版直连镜像都要进候选，按 url_list 原序排在 play 端点之前。"""
+    downloader, api_client = _build_downloader(tmp_path)
+
+    play_url = (
+        "https://www.douyin.com/aweme/v1/play/?video_id=clean&file_id=f"
+        "&sign=s&is_play_url=1&X-Bogus=abc"
+    )
+    aweme = {
+        "aweme_id": "1",
+        "video": {
+            "play_addr": {
+                "uri": "clean",
+                "url_list": [
+                    "https://v3-web.douyinvod.com/direct.mp4",
+                    "https://v9-web.douyinvod.com/direct.mp4",
+                    play_url,
+                ],
+            }
+        },
+    }
+
+    candidates = downloader._build_video_url_candidates(aweme)
+
+    assert [url for url, _ in candidates] == [
+        "https://v3-web.douyinvod.com/direct.mp4",
+        "https://v9-web.douyinvod.com/direct.mp4",
+        play_url,
+    ]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_video_download_falls_back_to_play_url_when_direct_fails(tmp_path):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    attempts = []
+
+    async def _fake_download_with_retry(self, url, save_path, _session, **kwargs):
+        attempts.append(url)
+        # 轮扫内必须禁用单 URL 退避重试（否则嵌套重试会把死节点等待
+        # 放大回本修复要消除的量级），失败降噪走 optional。
+        assert kwargs.get("retry") is False
+        assert kwargs.get("optional") is True
+        return url.startswith("https://www.douyin.com/aweme/v1/play/")
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    candidates = [
+        ("https://v3-web.douyinvod.com/direct.mp4", {}),
+        ("https://www.douyin.com/aweme/v1/play/?video_id=x&X-Bogus=b", {}),
+    ]
+
+    ok = await downloader._download_video_with_fallback(candidates, tmp_path / "v.mp4", object())
+
+    assert ok is True
+    assert attempts == [candidates[0][0], candidates[1][0]]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_video_download_fallback_retries_rounds_then_fails(tmp_path, monkeypatch):
+    """整轮候选都失败时按 RetryHandler 退避重跑整轮，穷尽后返回 False。"""
+    downloader, api_client = _build_downloader(tmp_path)
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("control.retry_handler.asyncio.sleep", _no_sleep)
+
+    attempts = []
+
+    async def _fake_download_with_retry(self, url, save_path, _session, **_kwargs):
+        attempts.append(url)
+        return False
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    candidates = [
+        ("https://v3-web.douyinvod.com/direct.mp4", {}),
+        ("https://www.douyin.com/aweme/v1/play/?video_id=x&X-Bogus=b", {}),
+    ]
+
+    ok = await downloader._download_video_with_fallback(candidates, tmp_path / "v.mp4", object())
+
+    # fixture 的 RetryHandler(max_retries=1) → 2 轮 × 2 个候选
+    assert ok is False
+    assert len(attempts) == 4
 
     await api_client.close()
 
@@ -323,6 +614,75 @@ async def test_download_aweme_assets_video_writes_cover_avatar_and_json(tmp_path
     assert any(path.name.endswith("_avatar.jpg") for path in saved_paths)
     metadata_files = list(tmp_path.rglob("*_data.json"))
     assert len(metadata_files) == 1
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_download_aweme_assets_cover_falls_back_across_mirrors(tmp_path, monkeypatch):
+    """Cover/avatar downloads must try every mirror in ``url_list``.
+
+    Douyin returns multiple CDN mirrors per image (p3/p9); the first sometimes
+    returns 403 while a later one succeeds. The download must fall back instead
+    of giving up after ``url_list[0]`` and silently dropping the real cover.
+    """
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=True,
+        avatar=True,
+        json=False,
+        folderstyle=True,
+        transcript={"enabled": False},
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+
+    attempted = []
+
+    async def _fake_download_with_retry(self, url, _save_path, _session, **_kwargs):
+        attempted.append(url)
+        # First mirror hard-fails (simulates 403); a later mirror succeeds.
+        return "mirror-fail" not in url
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    aweme_data = {
+        "aweme_id": "7600224486650121599",
+        "desc": "封面首镜像失败应回退",
+        "author": {
+            "nickname": "测试作者",
+            "avatar_larger": {
+                "url_list": [
+                    "https://mirror-fail.douyinpic.com/avatar.jpg",
+                    "https://p9-ok.douyinpic.com/avatar.jpg",
+                ]
+            },
+        },
+        "video": {
+            "play_addr": {"url_list": ["https://example.com/video.mp4"]},
+            "cover": {
+                "url_list": [
+                    "https://mirror-fail.douyinpic.com/cover.jpg",
+                    "https://p9-ok.douyinpic.com/cover.jpg",
+                ]
+            },
+        },
+    }
+
+    success = await downloader._download_aweme_assets(
+        aweme_data, author_name="测试作者", mode="post"
+    )
+
+    assert success is True
+    # Both cover mirrors attempted, and the working fallback was reached.
+    assert "https://mirror-fail.douyinpic.com/cover.jpg" in attempted
+    assert "https://p9-ok.douyinpic.com/cover.jpg" in attempted
+    # Same fallback behaviour for the avatar.
+    assert "https://p9-ok.douyinpic.com/avatar.jpg" in attempted
 
     await api_client.close()
 
@@ -553,6 +913,97 @@ def test_collect_image_urls_prefers_jpeg_over_webp_companion(tmp_path):
     urls = downloader._collect_image_urls(aweme_data)
 
     assert urls == ["https://example.com/image.jpeg"]
+
+    asyncio.run(api_client.close())
+
+
+def test_collect_image_urls_prefers_highest_resolution_clean_source(tmp_path):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    aweme_data = {
+        "aweme_id": "100007",
+        "image_post_info": {
+            "images": [
+                {
+                    "url_list": ["https://cdn.example.com/preview-720.jpg"],
+                    "width": 720,
+                    "height": 1280,
+                    "display_image": {
+                        "url_list": ["https://cdn.example.com/display-1080.jpg"],
+                        "width": 1080,
+                        "height": 1920,
+                    },
+                    "origin_image": {
+                        "url_list": ["https://cdn.example.com/origin-1440.jpg"],
+                        "width": 1440,
+                        "height": 2560,
+                    },
+                    "owner_watermark_image": {
+                        "url_list": ["https://cdn.example.com/highres-2160.jpg"],
+                        "width": 2160,
+                        "height": 3840,
+                    },
+                },
+            ]
+        },
+    }
+
+    candidates = downloader._collect_image_url_candidates(aweme_data)[0]
+
+    assert candidates == [
+        "https://cdn.example.com/origin-1440.jpg",
+        "https://cdn.example.com/display-1080.jpg",
+        "https://cdn.example.com/preview-720.jpg",
+        "https://cdn.example.com/highres-2160.jpg",
+    ]
+    assert downloader._collect_image_urls(aweme_data) == ["https://cdn.example.com/origin-1440.jpg"]
+
+    asyncio.run(api_client.close())
+
+
+def test_collect_image_urls_ranks_watermark_free_list_by_resolution(tmp_path):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    aweme_data = {
+        "aweme_id": "100008",
+        "image_post_info": {
+            "images": [
+                {
+                    "watermark_free_download_url_list": [
+                        "https://cdn.example.com/clean-free-720.jpg"
+                    ],
+                    "url_list": ["https://cdn.example.com/preview-720.jpg"],
+                    "width": 720,
+                    "height": 1280,
+                    "display_image": {
+                        "url_list": ["https://cdn.example.com/display-1080.jpg"],
+                        "width": 1080,
+                        "height": 1920,
+                    },
+                    "origin_image": {
+                        "url_list": ["https://cdn.example.com/origin-1440.jpg"],
+                        "width": 1440,
+                        "height": 2560,
+                    },
+                    "download_url": {
+                        "url_list": ["https://cdn.example.com/fallback-2160.jpg"],
+                        "width": 2160,
+                        "height": 3840,
+                    },
+                },
+            ]
+        },
+    }
+
+    candidates = downloader._collect_image_url_candidates(aweme_data)[0]
+
+    assert candidates == [
+        "https://cdn.example.com/origin-1440.jpg",
+        "https://cdn.example.com/display-1080.jpg",
+        "https://cdn.example.com/clean-free-720.jpg",
+        "https://cdn.example.com/preview-720.jpg",
+        "https://cdn.example.com/fallback-2160.jpg",
+    ]
 
     asyncio.run(api_client.close())
 

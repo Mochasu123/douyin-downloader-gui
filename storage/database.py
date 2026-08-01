@@ -119,6 +119,27 @@ class Database:
         )
         await db.execute("CREATE INDEX IF NOT EXISTS idx_job_created_at ON job(created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_job_status ON job(status)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS parse_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                content_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                original_url TEXT NOT NULL,
+                resolved_url TEXT NOT NULL DEFAULT '',
+                author_name TEXT NOT NULL DEFAULT '',
+                avatar_url TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_parse_history_unique
+            ON parse_history(kind, content_id, name)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_parse_history_kind_time
+            ON parse_history(kind, created_at)
+        """)
 
         # Incremental migration: add author_sec_uid column to legacy aweme tables.
         # Running initialize() twice must be a no-op.
@@ -237,6 +258,105 @@ class Database:
             ),
         )
         await db.commit()
+
+    async def add_parse_history(
+        self, entry: Dict[str, Any], *, per_kind_limit: int = 200
+    ) -> bool:
+        """记录一条成功解析的历史；同 kind+content_id+name 只保留首次。
+
+        Returns:
+            是否真正插入了新记录（重复解析返回 False）。
+        """
+        db = await self._get_conn()
+        kind = str(entry.get("kind") or "")
+        content_id = str(entry.get("content_id") or "")
+        name = (str(entry.get("name") or "")).strip() or "未知"
+        cursor = await db.execute(
+            """
+            INSERT OR IGNORE INTO parse_history
+            (kind, content_id, name, original_url, resolved_url,
+             author_name, avatar_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                kind,
+                content_id,
+                name,
+                str(entry.get("original_url") or ""),
+                str(entry.get("resolved_url") or ""),
+                str(entry.get("author_name") or ""),
+                str(entry.get("avatar_url") or ""),
+                entry.get("created_at")
+                or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        await db.commit()
+        inserted = cursor.rowcount > 0
+        if inserted and per_kind_limit > 0 and kind:
+            await db.execute(
+                """
+                DELETE FROM parse_history
+                WHERE kind = ? AND id NOT IN (
+                    SELECT id FROM parse_history
+                    WHERE kind = ? ORDER BY created_at DESC, id DESC LIMIT ?
+                )
+                """,
+                (kind, kind, per_kind_limit),
+            )
+            await db.commit()
+        return inserted
+
+    async def list_parse_history(
+        self,
+        *,
+        kinds: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """列出解析历史，最新在前。kind 为空表示全部类型。"""
+        db = await self._get_conn()
+        columns = (
+            "id", "kind", "content_id", "name", "original_url",
+            "resolved_url", "author_name", "avatar_url", "created_at",
+        )
+        sql = (
+            f"SELECT {', '.join(columns)} FROM parse_history "
+            "ORDER BY created_at DESC, id DESC LIMIT ?"
+        )
+        params: List[Any] = [limit]
+        if kinds:
+            placeholders = ", ".join("?" for _ in kinds)
+            sql = (
+                f"SELECT {', '.join(columns)} FROM parse_history "
+                f"WHERE kind IN ({placeholders}) "
+                "ORDER BY created_at DESC, id DESC LIMIT ?"
+            )
+            params = [*kinds, limit]
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        return [dict(zip(columns, row)) for row in rows]
+
+    async def delete_parse_history(self, ids: List[int]) -> int:
+        """按主键删除历史记录，返回删除条数。"""
+        ids = [int(i) for i in ids if str(i).isdigit()]
+        if not ids:
+            return 0
+        db = await self._get_conn()
+        placeholders = ", ".join("?" for _ in ids)
+        cursor = await db.execute(
+            f"DELETE FROM parse_history WHERE id IN ({placeholders})", ids)
+        await db.commit()
+        return cursor.rowcount
+
+    async def clear_parse_history(self, kind: Optional[str] = None) -> int:
+        """清空解析历史（可只清某类），返回删除条数。"""
+        db = await self._get_conn()
+        if kind:
+            cursor = await db.execute(
+                "DELETE FROM parse_history WHERE kind = ?", (kind,))
+        else:
+            cursor = await db.execute("DELETE FROM parse_history")
+        await db.commit()
+        return cursor.rowcount
 
     async def get_aweme_history(
         self,

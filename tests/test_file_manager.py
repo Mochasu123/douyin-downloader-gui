@@ -40,6 +40,307 @@ def test_get_save_path_creates_directories(tmp_path):
     assert "123" in str(path)
 
 
+def test_get_save_path_author_dir_nickname_default(tmp_path):
+    """Default (style omitted or ``nickname``) keeps legacy behaviour."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "测试作者",
+        mode="post",
+        aweme_title="T",
+        aweme_id="1",
+        author_sec_uid="MS4wLjABAAAA_abc",
+        author_dir_style="nickname",
+    )
+    assert "测试作者" in str(path)
+    assert "MS4wLjABAAAA_abc" not in str(path)
+
+
+def test_get_author_dir_matches_save_path_author_root(tmp_path):
+    fm = FileManager(str(tmp_path))
+    author_dir = fm.get_author_dir(
+        "测试作者",
+        author_sec_uid="sec_uid_x",
+        author_dir_style="nickname_uid",
+    )
+    save_path = fm.get_save_path(
+        "测试作者",
+        mode="post",
+        aweme_title="T",
+        aweme_id="1",
+        author_sec_uid="sec_uid_x",
+        author_dir_style="nickname_uid",
+    )
+
+    assert author_dir == tmp_path / "测试作者_sec_uid_x"
+    assert author_dir.exists()
+    assert author_dir in save_path.parents
+
+
+def test_get_save_path_author_dir_sec_uid(tmp_path):
+    """``sec_uid`` style puts the sec_uid at the author level."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "测试作者",
+        mode="post",
+        aweme_title="T",
+        aweme_id="1",
+        author_sec_uid="MS4wLjABAAAA_abc",
+        author_dir_style="sec_uid",
+    )
+    parts = path.parts
+    # Author layer is directly under base_path: .../{base}/{author}/{mode}/...
+    author_layer = parts[parts.index("post") - 1]
+    assert author_layer == "MS4wLjABAAAA_abc"
+
+
+def test_get_save_path_author_dir_nickname_uid(tmp_path):
+    """``nickname_uid`` joins nickname and sec_uid with an underscore."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "测试作者",
+        mode="post",
+        aweme_title="T",
+        aweme_id="1",
+        author_sec_uid="MS4wLjABAAAA_abc",
+        author_dir_style="nickname_uid",
+    )
+    parts = path.parts
+    author_layer = parts[parts.index("post") - 1]
+    assert author_layer == "测试作者_MS4wLjABAAAA_abc"
+
+
+def test_get_save_path_sec_uid_missing_falls_back_to_nickname(tmp_path, caplog, monkeypatch):
+    """sec_uid style with missing uid must degrade to nickname + warning."""
+    import logging
+
+    # FileManager uses a namespaced logger with ``propagate=False``; enable
+    # propagation temporarily so pytest's ``caplog`` can see the warning.
+    monkeypatch.setattr(logging.getLogger("FileManager"), "propagate", True)
+    fm = FileManager(str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        path = fm.get_save_path(
+            "测试作者",
+            mode="live",
+            aweme_title="T",
+            aweme_id="room1",
+            author_sec_uid=None,
+            author_dir_style="sec_uid",
+        )
+    parts = path.parts
+    author_layer = parts[parts.index("live") - 1]
+    assert author_layer == "测试作者"
+    assert any("sec_uid is missing" in r.message for r in caplog.records)
+
+
+def test_get_save_path_nickname_uid_missing_falls_back(tmp_path, caplog, monkeypatch):
+    """nickname_uid with missing sec_uid must degrade to nickname + warning."""
+    import logging
+
+    monkeypatch.setattr(logging.getLogger("FileManager"), "propagate", True)
+    fm = FileManager(str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        path = fm.get_save_path(
+            "测试作者",
+            mode="music",
+            aweme_title="T",
+            aweme_id="music_1",
+            author_sec_uid="   ",  # whitespace counts as missing
+            author_dir_style="nickname_uid",
+        )
+    parts = path.parts
+    author_layer = parts[parts.index("music") - 1]
+    assert author_layer == "测试作者"
+    assert any("sec_uid is missing" in r.message for r in caplog.records)
+
+
+def test_get_save_path_unknown_style_falls_back(tmp_path, caplog, monkeypatch):
+    """An unknown author_dir style warns and falls back to nickname."""
+    import logging
+
+    monkeypatch.setattr(logging.getLogger("FileManager"), "propagate", True)
+    fm = FileManager(str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        path = fm.get_save_path(
+            "测试作者",
+            mode="post",
+            aweme_title="T",
+            aweme_id="1",
+            author_sec_uid="MS4w_abc",
+            author_dir_style="bogus",
+        )
+    parts = path.parts
+    author_layer = parts[parts.index("post") - 1]
+    assert author_layer == "测试作者"
+    assert any("Unknown author_dir style" in r.message for r in caplog.records)
+
+
+def test_get_save_path_group_by_mode_false_flattens(tmp_path):
+    """group_by_mode=False drops the mode (e.g. ``post``) segment entirely so
+    files land directly under the author directory — reproducing the legacy
+    ``{base}/{author}/...`` layout (no ``POST`` folder)."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "某作者",
+        mode="post",
+        aweme_title="T",
+        aweme_id="1",
+        folderstyle=False,
+        group_by_mode=False,
+    )
+    parts = path.parts
+    assert "post" not in parts
+    # Author dir is the leaf when folderstyle is also off.
+    assert path.name == "某作者"
+
+
+def test_get_save_path_group_by_mode_false_keeps_leaf_folder(tmp_path):
+    """group_by_mode only removes the mode layer; folderstyle's per-aweme
+    subfolder is independent and must still apply when enabled."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "某作者",
+        mode="post",
+        aweme_title="标题",
+        aweme_id="123",
+        folderstyle=True,
+        folder_name="2024-01-01_标题_123",
+        group_by_mode=False,
+    )
+    parts = path.parts
+    assert "post" not in parts
+    assert path.name == "2024-01-01_标题_123"
+    assert path.parent.name == "某作者"
+
+
+def test_get_save_path_group_by_mode_true_default_keeps_mode(tmp_path):
+    """Default (omitted) keeps the mode folder — zero behaviour change."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "某作者", mode="post", aweme_title="T", aweme_id="1", folderstyle=False
+    )
+    assert path.parts[-1] == "post"
+    assert path.parts[-2] == "某作者"
+
+
+def test_get_save_path_collection_dir_inserts_folder(tmp_path):
+    """``collection_dir`` inserts a folder between the mode layer and the
+    per-aweme leaf: ``base/<author>/mix/<collection>/<leaf>``. This is what
+    puts each 合集 in its own directory."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "某作者",
+        mode="mix",
+        folderstyle=True,
+        folder_name="2024-01-01_标题_123",
+        collection_dir="我的合集",
+    )
+    assert path.name == "2024-01-01_标题_123"
+    assert path.parent.name == "我的合集"
+    assert path.parent.parent.name == "mix"
+    assert path.parent.parent.parent.name == "某作者"
+
+
+def test_get_save_path_collection_dir_is_sanitized(tmp_path):
+    """Mix names can contain path separators / illegal chars; the collection
+    layer must be sanitized so it never escapes into sub-paths."""
+    from utils.validators import sanitize_filename
+
+    fm = FileManager(str(tmp_path))
+    raw = "a/b:c*d?"
+    path = fm.get_save_path(
+        "A", mode="mix", folderstyle=False, collection_dir=raw
+    )
+    # folderstyle off → the collection folder is the leaf.
+    assert path.name == sanitize_filename(raw)
+    assert "/" not in path.name
+
+
+def test_get_save_path_collection_dir_empty_keeps_legacy_layout(tmp_path):
+    """Empty/None ``collection_dir`` inserts no extra layer — zero behaviour
+    change for every non-mix caller."""
+    fm = FileManager(str(tmp_path))
+    for empty in ("", None, "   "):
+        path = fm.get_save_path(
+            "A", mode="mix", folderstyle=False, collection_dir=empty
+        )
+        assert path.name == "mix"
+        assert path.parent.name == "A"
+
+
+def test_get_save_path_collection_dir_group_by_mode_false(tmp_path):
+    """With group_by_mode off there is no ``mix`` layer, but the collection
+    folder still applies directly under the author dir."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "A",
+        mode="mix",
+        folderstyle=False,
+        collection_dir="合集X",
+        group_by_mode=False,
+    )
+    assert path.name == "合集X"
+    assert path.parent.name == "A"
+    assert "mix" not in path.parts
+
+
+def test_get_save_path_author_dir_user_sec_uid(tmp_path):
+    """``user_sec_uid`` style prefixes the sec_uid with ``user_`` to match the
+    legacy DouYin-Downloader on-disk layout."""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "某作者",
+        mode="post",
+        aweme_title="T",
+        aweme_id="1",
+        author_sec_uid="MS4wLjABAAAA_abc",
+        author_dir_style="user_sec_uid",
+    )
+    parts = path.parts
+    author_layer = parts[parts.index("post") - 1]
+    assert author_layer == "user_MS4wLjABAAAA_abc"
+
+
+def test_get_save_path_user_sec_uid_preserves_double_underscore(tmp_path):
+    """Real sec_uids contain ``__`` (double underscore). ``user_sec_uid`` must
+    NOT collapse them — otherwise new downloads land in a different folder than
+    the user's existing ``user_MS4wLjABAAAA__Wip...`` directory, defeating the
+    whole point of the style. (The legacy tool used the raw, un-collapsed
+    sec_uid.)"""
+    fm = FileManager(str(tmp_path))
+    path = fm.get_save_path(
+        "某作者",
+        mode="post",
+        aweme_title="T",
+        aweme_id="1",
+        author_sec_uid="MS4wLjABAAAA__WipbB2",
+        author_dir_style="user_sec_uid",
+    )
+    parts = path.parts
+    author_layer = parts[parts.index("post") - 1]
+    assert author_layer == "user_MS4wLjABAAAA__WipbB2"
+
+
+def test_get_save_path_user_sec_uid_missing_falls_back(tmp_path, caplog, monkeypatch):
+    """user_sec_uid with missing sec_uid must degrade to nickname + warning."""
+    import logging
+
+    monkeypatch.setattr(logging.getLogger("FileManager"), "propagate", True)
+    fm = FileManager(str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        path = fm.get_save_path(
+            "某作者",
+            mode="post",
+            aweme_title="T",
+            aweme_id="1",
+            author_sec_uid=None,
+            author_dir_style="user_sec_uid",
+        )
+    parts = path.parts
+    author_layer = parts[parts.index("post") - 1]
+    assert author_layer == "某作者"
+    assert any("sec_uid is missing" in r.message for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_download_file_atomic_write(tmp_path):
     """Downloaded file should appear only after successful completion (atomic rename)."""
@@ -72,6 +373,47 @@ async def test_download_file_atomic_write(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_download_file_sets_granular_timeouts(tmp_path):
+    """/aweme/v1/play/ 302 后可能落到打不通的 PCDN 节点（高位端口 SYN 黑洞），
+    没有 connect 细分超时时握手会把 total=300s 全部耗光（线上日志实测两次
+    重试间隔正好 300s），批量任务队尾因此长时间停滞。"""
+    fm = FileManager(str(tmp_path))
+    session = _aiohttp_session_returning_status(404)
+
+    await fm.download_file("https://example.com/v.mp4", tmp_path / "v.mp4", session=session)
+
+    timeout = session.get.call_args.kwargs["timeout"]
+    assert timeout.total == 300
+    assert timeout.connect == 15
+    assert timeout.sock_read == 60
+
+
+@pytest.mark.asyncio
+async def test_httpx_fallback_sets_granular_timeouts(tmp_path, monkeypatch):
+    """httpx 403 兜底路径与 aiohttp 主路径保持同样的连接/读间隙上限。"""
+    fm = FileManager(str(tmp_path))
+    captured = {}
+    calls = []
+    response = _FakeHttpxResponse(200, b"x", {"Content-Type": "image/jpeg", "Content-Length": "1"})
+
+    def _fake_client(*args, **kwargs):
+        captured.update(kwargs)
+        return _FakeHttpxClient(response, calls)
+
+    monkeypatch.setattr("storage.file_manager.httpx.AsyncClient", _fake_client)
+
+    await fm.download_file(
+        "https://p3-pc-sign.douyinpic.com/x.jpg",
+        tmp_path / "x.jpg",
+        session=_aiohttp_session_returning_status(403),
+    )
+
+    timeout = captured["timeout"]
+    assert timeout.connect == 15
+    assert timeout.read == 60
+
+
+@pytest.mark.asyncio
 async def test_download_file_size_mismatch_cleans_up(tmp_path):
     fm = FileManager(str(tmp_path))
     save_path = tmp_path / "video.mp4"
@@ -97,3 +439,111 @@ async def test_download_file_size_mismatch_cleans_up(tmp_path):
     assert result is False
     assert not save_path.exists()
     assert not save_path.with_suffix(".mp4.tmp").exists()
+
+
+class _FakeContent:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    async def iter_chunked(self, _size):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _FakeResponse:
+    def __init__(self, status=206, chunks=(b"abc",), headers=None):
+        self.status = status
+        self.content = _FakeContent(chunks)
+        self.content_length = sum(len(chunk) for chunk in chunks)
+        self.headers = headers or {"Content-Type": "video/mp4", "Content-Range": "bytes 0-2/3"}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, response):
+        self.response = response
+
+    def get(self, *args, **kwargs):
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_download_file_accepts_complete_partial_content_206(tmp_path):
+    fm = FileManager(str(tmp_path))
+    target = tmp_path / "range.mp4"
+    session = _FakeSession(_FakeResponse(status=206, chunks=(b"ab", b"c")))
+
+    ok = await fm.download_file("https://cdn.example/range.mp4", target, session=session)
+
+    assert ok is True
+    assert target.read_bytes() == b"abc"
+
+
+@pytest.mark.asyncio
+async def test_download_file_rejects_incomplete_partial_content_206(tmp_path):
+    fm = FileManager(str(tmp_path))
+    target = tmp_path / "range.mp4"
+    session = _FakeSession(
+        _FakeResponse(
+            status=206,
+            chunks=(b"abc",),
+            headers={"Content-Type": "video/mp4", "Content-Range": "bytes 100-102/1000"},
+        )
+    )
+
+    ok = await fm.download_file("https://cdn.example/range.mp4", target, session=session)
+
+    assert ok is False
+    assert not target.exists()
+
+
+def _aiohttp_session_returning_status(status):
+    """Build a mock aiohttp session whose ``get`` yields a response with the
+    given HTTP status (and no body — the non-200 path never reads content)."""
+    mock_response = AsyncMock()
+    mock_response.status = status
+
+    ctx = AsyncMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_response)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = MagicMock()
+    mock_session.get.return_value = ctx
+    return mock_session
+
+
+class _FakeHttpxResponse:
+    def __init__(self, status_code, content, headers):
+        self.status_code = status_code
+        self._content = content
+        self.headers = headers
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aiter_bytes(self):
+        yield self._content
+
+
+class _FakeHttpxClient:
+    def __init__(self, response, calls):
+        self._response = response
+        self._calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def stream(self, method, url, headers=None):
+        self._calls.append((method, url, headers))
+        return self._response

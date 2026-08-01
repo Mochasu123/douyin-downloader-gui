@@ -1,6 +1,9 @@
 import asyncio
+import base64
+import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +24,8 @@ def test_build_signed_path_fallbacks_to_xbogus_when_abogus_disabled():
 
 
 def test_build_signed_path_prefers_abogus(monkeypatch):
+    captured = {}
+
     class _FakeFp:
         @staticmethod
         def generate_fingerprint(_browser):
@@ -32,6 +37,7 @@ def test_build_signed_path_prefers_abogus(monkeypatch):
             self.user_agent = user_agent
 
         def generate_abogus(self, params, body=""):
+            captured.update(params=params, body=body)
             return (f"{params}&a_bogus=fake_ab", "fake_ab", self.user_agent, body)
 
     import core.api_client as api_module
@@ -42,8 +48,99 @@ def test_build_signed_path_prefers_abogus(monkeypatch):
     client = DouyinAPIClient({"msToken": "token-1"})
     client._abogus_enabled = True
 
-    signed_url, _ua = client.build_signed_path("/aweme/v1/web/aweme/detail/", {"a": 1})
+    signed_url, _ua = client.build_signed_path(
+        "/aweme/v1/web/aweme/detail/", {"a": 1}, request_data={"cursor": 3, "count": 20}
+    )
     assert "a_bogus=fake_ab" in signed_url
+    assert captured["body"] == "cursor=3&count=20"
+
+
+def test_homepage_screenshot_bridge_emits_encoded_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DOUYIN_HOMEPAGE_SCREENSHOT_BRIDGE", "electron")
+    client = DouyinAPIClient({"msToken": "token-1"})
+    target = (tmp_path / "作者" / "主页截图.png").resolve()
+
+    saved = asyncio.run(client.save_user_homepage_screenshot("sec_uid_x", target))
+
+    assert saved is True
+    line = capsys.readouterr().out.strip()
+    prefix = "DOUYIN_HOMEPAGE_SCREENSHOT_REQUEST "
+    assert line.startswith(prefix)
+    encoded = line[len(prefix) :]
+    encoded += "=" * (-len(encoded) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    assert payload == {"version": 1, "sec_uid": "sec_uid_x", "save_path": str(target)}
+
+
+def test_homepage_screenshot_playwright_captures_viewport(tmp_path, monkeypatch):
+    captured = {}
+
+    class _FakePage:
+        async def goto(self, url, **kwargs):
+            captured["url"] = url
+            captured["goto"] = kwargs
+
+        async def title(self):
+            return "作者主页"
+
+        async def wait_for_timeout(self, timeout_ms):
+            captured["wait_ms"] = timeout_ms
+
+        async def screenshot(self, **kwargs):
+            captured["screenshot"] = kwargs
+            Path(kwargs["path"]).write_bytes(b"png")
+
+    class _FakeContext:
+        async def add_cookies(self, cookies):
+            captured["cookies"] = cookies
+
+        async def new_page(self):
+            return _FakePage()
+
+        async def close(self):
+            captured["context_closed"] = True
+
+    class _FakeBrowser:
+        async def new_context(self, **kwargs):
+            captured["context"] = kwargs
+            return _FakeContext()
+
+        async def close(self):
+            captured["browser_closed"] = True
+
+    class _FakeChromium:
+        async def launch(self, **kwargs):
+            captured["launch"] = kwargs
+            return _FakeBrowser()
+
+    class _FakePlaywright:
+        chromium = _FakeChromium()
+
+    class _FakeManager:
+        async def __aenter__(self):
+            return _FakePlaywright()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: _FakeManager()
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+    monkeypatch.delenv("DOUYIN_HOMEPAGE_SCREENSHOT_BRIDGE", raising=False)
+
+    client = DouyinAPIClient({"msToken": "token-1", "sessionid_ss": "cookie"})
+    target = tmp_path / "主页截图.png"
+    saved = asyncio.run(client.save_user_homepage_screenshot("sec_uid_x", target))
+
+    assert saved is True
+    assert target.read_bytes() == b"png"
+    assert captured["context"]["viewport"] == {"width": 1600, "height": 900}
+    assert captured["screenshot"]["full_page"] is False
+    assert captured["screenshot"]["type"] == "png"
+    assert captured["context_closed"] is True
+    assert captured["browser_closed"] is True
 
 
 def test_browser_fallback_caps_warmup_wait(monkeypatch):
@@ -191,6 +288,46 @@ async def test_get_user_post_returns_normalized_dto(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_replay_endpoints_use_episode_paths(monkeypatch):
+    client = DouyinAPIClient({"msToken": "token-1"})
+    called_requests = []
+
+    async def _fake_request_json(path, params, suppress_error=False):
+        called_requests.append((path, dict(params), suppress_error))
+        if path == "/aweme/v1/web/show/episode/enter/":
+            return {"status_code": 0, "data": {"episode": {"attach_room_id_str": "room-1"}}}
+        if path == "/aweme/v1/web/show/episode/replay_list/":
+            return {
+                "status_code": 0,
+                "data": {
+                    "all_replay": [
+                        {"info_list": [{"episode_id_str": "ep-1", "title": "回放"}]}
+                    ]
+                },
+            }
+        return {}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request_json)
+
+    episode = await client.get_live_replay_episode("ep-1")
+    replay = await client.get_live_replay_info("ep-1", "room-1")
+
+    assert episode == {"attach_room_id_str": "room-1"}
+    assert replay["episode_id_str"] == "ep-1"
+    assert [call[0] for call in called_requests] == [
+        "/aweme/v1/web/show/episode/enter/",
+        "/aweme/v1/web/show/episode/replay_list/",
+    ]
+    assert called_requests[0][1]["episode_id"] == "ep-1"
+    assert called_requests[0][1]["channel"] == ""
+    assert called_requests[0][2] is True
+    assert called_requests[1][1]["episode_id"] == "ep-1"
+    assert called_requests[1][1]["room_id"] == "room-1"
+    assert called_requests[1][1]["channel"] == ""
+    assert called_requests[1][2] is True
+
+
+@pytest.mark.asyncio
 async def test_user_mode_endpoints_use_shared_paged_normalization(monkeypatch):
     client = DouyinAPIClient({"msToken": "token-1"})
     called_requests = []
@@ -225,12 +362,77 @@ async def test_user_mode_endpoints_use_shared_paged_normalization(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_user_mix_normalizes_real_mix_infos_response(monkeypatch):
+    client = DouyinAPIClient({"msToken": "token-1"})
+    mix_infos = [
+        {
+            "mix_id": "7600000000000000001",
+            "mix_name": "合集 A",
+            "statis": {"updated_to_episode": 30},
+            "author": {"nickname": "作者 A", "sec_uid": "SEC_AUTHOR"},
+        }
+    ]
+
+    async def _fake_request_json(path, params, suppress_error=False):
+        return {
+            "cursor": 0,
+            "extra": {"fatal_item_ids": [], "logid": "log-1", "now": 1},
+            "has_more": 0,
+            "log_pb": {"impr_id": "impr-1"},
+            "min_cursor": 0,
+            "mix_infos": mix_infos,
+            "status_code": 0,
+            "status_msg": None,
+            "total": 1,
+        }
+
+    monkeypatch.setattr(client, "_request_json", _fake_request_json)
+
+    data = await client.get_user_mix("SEC_AUTHOR", max_cursor=0, count=20)
+
+    assert data["items"] == mix_infos
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_items", "expected_items"),
+    [
+        ({"mix_list": [{"mix_id": "legacy"}]}, [{"mix_id": "legacy"}]),
+        (
+            {"mix_infos": [], "mix_list": [{"mix_id": "legacy"}]},
+            [],
+        ),
+    ],
+)
+async def test_get_user_mix_preserves_legacy_fallback_and_new_field_priority(
+    monkeypatch, response_items, expected_items
+):
+    client = DouyinAPIClient({"msToken": "token-1"})
+
+    async def _fake_request_json(path, params, suppress_error=False):
+        return {"status_code": 0, **response_items}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request_json)
+
+    data = await client.get_user_mix("SEC_AUTHOR", max_cursor=0, count=20)
+
+    assert data["items"] == expected_items
+
+
+@pytest.mark.asyncio
 async def test_collect_endpoints_use_expected_paths_and_normalization(monkeypatch):
     client = DouyinAPIClient({"msToken": "token-1"})
     called_requests = []
 
-    async def _fake_request_json(path, params, suppress_error=False):
-        called_requests.append((path, dict(params)))
+    async def _fake_request_json(path, params, suppress_error=False, **kwargs):
+        called_requests.append((path, dict(params), kwargs))
+        if path == "/aweme/v1/web/aweme/listcollection/":
+            return {
+                "status_code": 0,
+                "aweme_list": [{"aweme_id": "account-aweme-1"}],
+                "has_more": 1,
+                "cursor": 7,
+            }
         if path == "/aweme/v1/web/collects/list/":
             return {
                 "status_code": 0,
@@ -256,20 +458,35 @@ async def test_collect_endpoints_use_expected_paths_and_normalization(monkeypatc
 
     monkeypatch.setattr(client, "_request_json", _fake_request_json)
 
+    account_collection_data = await client.get_user_collection("self", max_cursor=3, count=20)
     collects_data = await client.get_user_collects("self", max_cursor=0, count=10)
     collect_aweme_data = await client.get_collect_aweme("collect-1", max_cursor=0, count=10)
     collect_mix_data = await client.get_user_collect_mix("self", max_cursor=0, count=12)
 
-    assert [path for path, _params in called_requests] == [
+    assert [path for path, _params, _kwargs in called_requests] == [
+        "/aweme/v1/web/aweme/listcollection/",
         "/aweme/v1/web/collects/list/",
         "/aweme/v1/web/collects/video/list/",
         "/aweme/v1/web/mix/listcollection/",
     ]
-    assert called_requests[0][1]["count"] == 10
-    assert called_requests[0][1]["version_code"] == "170400"
-    assert called_requests[1][1]["collects_id"] == "collect-1"
+    account_path, account_params, account_kwargs = called_requests[0]
+    assert account_path == "/aweme/v1/web/aweme/listcollection/"
+    assert account_params["publish_video_strategy_type"] == "2"
+    assert account_params["version_code"] == "170400"
+    assert account_kwargs["method"] == "POST"
+    assert account_kwargs["data"] == {"count": 20, "cursor": 3}
+    assert account_kwargs["request_headers"]["Content-Type"] == (
+        "application/x-www-form-urlencoded"
+    )
+    assert account_kwargs["request_headers"]["Referer"].endswith("showTab=favorite_collection")
     assert called_requests[1][1]["count"] == 10
-    assert called_requests[2][1]["count"] == 12
+    assert called_requests[1][1]["version_code"] == "170400"
+    assert called_requests[2][1]["collects_id"] == "collect-1"
+    assert called_requests[2][1]["count"] == 10
+    assert called_requests[3][1]["count"] == 12
+    assert account_collection_data["items"] == [{"aweme_id": "account-aweme-1"}]
+    assert account_collection_data["has_more"] is True
+    assert account_collection_data["max_cursor"] == 7
     assert collects_data["items"] == [{"collects_id_str": "collect-1"}]
     assert collects_data["has_more"] is True
     assert collects_data["max_cursor"] == 9

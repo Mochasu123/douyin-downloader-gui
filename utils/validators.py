@@ -49,6 +49,27 @@ SHORT_URL_HOSTS = (
     "iesdouyin.com",
 )
 
+_URL_LINE_RE = re.compile(
+    r"https?://[^\s\u3000，。；！？、（）【】《》“”‘’]+",
+    re.IGNORECASE,
+)
+
+
+def extract_url_from_line(text: str) -> Optional[str]:
+    """从粘贴的一行分享文本中提取第一个 http(s) 链接。
+
+    抖音 App 复制的分享文案常带前缀文字与标点，例如：
+    “8.88 复制打开抖音 https://v.douyin.com/xxxx/ 看看”。
+    找不到链接时返回 None。
+    """
+    if not text:
+        return None
+    match = _URL_LINE_RE.search(text)
+    if not match:
+        return None
+    url = match.group(0).rstrip(".,;:!?)]}>\"'）】》")
+    return url or None
+
 
 def is_short_url(url: str) -> bool:
     """判断是否为需要预先解析的短链。"""

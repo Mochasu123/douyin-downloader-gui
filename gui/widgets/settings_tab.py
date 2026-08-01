@@ -25,8 +25,12 @@ class SettingsTab(ttk.Frame):
         "sid_guard=xxx; sid_tt=xxx; uid_tt=xxx; n_mh=xxx"
     )
 
+    VIDEO_QUALITY_LABELS = ("最高", "1440p", "1080p", "720p", "540p", "480p", "360p", "最低")
+
     def __init__(self, parent, path_var, cookie_var, retry_var,
-                 browser_fallback_var,
+                 browser_fallback_var, video_quality_var,
+                 cover_var, music_var, avatar_var, json_var,
+                 increase_var, homepage_screenshot_var, live_photo_merge_var,
                  on_save, on_open_dir):
         super().__init__(parent, padding=(16, 12, 16, 8))
         self.on_save = on_save
@@ -36,6 +40,14 @@ class SettingsTab(ttk.Frame):
         self.retry_var_ref = retry_var
         self.fallback_var_ref = browser_fallback_var
         self.cookie_var_ref = cookie_var
+        self.video_quality_var_ref = video_quality_var
+        self.cover_var_ref = cover_var
+        self.music_var_ref = music_var
+        self.avatar_var_ref = avatar_var
+        self.json_var_ref = json_var
+        self.increase_var_ref = increase_var
+        self.homepage_screenshot_var_ref = homepage_screenshot_var
+        self.live_photo_merge_var_ref = live_photo_merge_var
 
         # ── Row 0: Download path ─────────────────────────────────
         path_row = ttk.Frame(self)
@@ -96,6 +108,35 @@ class SettingsTab(ttk.Frame):
         ttk.Label(adv, text="线程: 3（自动）", foreground="#94A3B8",
                   font=FONT_SMALL).pack(side="left", padx=(16, 0))
 
+        # ── Row 3: Video quality ──────────────────────────────────
+        quality_row = ttk.Frame(self)
+        quality_row.pack(fill="x", pady=(14, 0))
+        ttk.Label(quality_row, text="视频画质").pack(side="left")
+        ttk.Combobox(quality_row, textvariable=video_quality_var,
+                     values=self.VIDEO_QUALITY_LABELS, state="readonly", width=8
+                     ).pack(side="left", padx=(6, 0))
+
+        # ── Row: Download options (moved from link tab) ──────────
+        ttk.Separator(self, orient="horizontal").pack(fill="x", pady=(12, 8))
+        ttk.Label(self, text="下载选项", font=FONT_SECTION).pack(anchor="w")
+        opts1 = ttk.Frame(self)
+        opts1.pack(fill="x", pady=(8, 2))
+        for var, text in ((cover_var, "封面"), (music_var, "音乐"),
+                          (avatar_var, "头像"), (json_var, "JSON")):
+            tk.Checkbutton(opts1, text=text, variable=var,
+                           relief="flat", bg="#FFFFFF", activebackground="#EFF6FF",
+                           selectcolor="#FFFFFF", fg="#0F172A", font=FONT
+                           ).pack(side="left", padx=(0, 14))
+        opts2 = ttk.Frame(self)
+        opts2.pack(fill="x", pady=(2, 0))
+        for var, text in ((increase_var, "增量"),
+                          (homepage_screenshot_var, "主页截图"),
+                          (live_photo_merge_var, "动图合并")):
+            tk.Checkbutton(opts2, text=text, variable=var,
+                           relief="flat", bg="#FFFFFF", activebackground="#EFF6FF",
+                           selectcolor="#FFFFFF", fg="#0F172A", font=FONT
+                           ).pack(side="left", padx=(0, 14))
+
         # ── Row 4: Buttons ───────────────────────────────────────
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(12, 0))
@@ -114,10 +155,22 @@ class SettingsTab(ttk.Frame):
         self._base_path = path_var.get()
         self._base_retry = retry_var.get()
         self._base_fallback = browser_fallback_var.get()
+        self._base_video_quality = video_quality_var.get()
+        self._base_cover = cover_var.get()
+        self._base_music = music_var.get()
+        self._base_avatar = avatar_var.get()
+        self._base_json = json_var.get()
+        self._base_increase = increase_var.get()
+        self._base_homepage = homepage_screenshot_var.get()
+        self._base_live_merge = live_photo_merge_var.get()
 
         path_var.trace_add("write", self._update_save_state)
         retry_var.trace_add("write", self._update_save_state)
         browser_fallback_var.trace_add("write", self._update_save_state)
+        video_quality_var.trace_add("write", self._update_save_state)
+        for var in (cover_var, music_var, avatar_var, json_var,
+                    increase_var, homepage_screenshot_var, live_photo_merge_var):
+            var.trace_add("write", self._update_save_state)
 
         self._lock_cookie()
         self._update_cookie_status(self._real_cookie)
@@ -135,6 +188,14 @@ class SettingsTab(ttk.Frame):
             self.path_var_ref.get() != self._base_path
             or int(self.retry_var_ref.get()) != self._base_retry
             or bool(self.fallback_var_ref.get()) != self._base_fallback
+            or self.video_quality_var_ref.get() != self._base_video_quality
+            or bool(self.cover_var_ref.get()) != self._base_cover
+            or bool(self.music_var_ref.get()) != self._base_music
+            or bool(self.avatar_var_ref.get()) != self._base_avatar
+            or bool(self.json_var_ref.get()) != self._base_json
+            or bool(self.increase_var_ref.get()) != self._base_increase
+            or bool(self.homepage_screenshot_var_ref.get()) != self._base_homepage
+            or bool(self.live_photo_merge_var_ref.get()) != self._base_live_merge
             or self._real_cookie != self._saved_cookie
         )
         self.save_btn.configure(state="normal" if changed else "disabled")
@@ -145,6 +206,14 @@ class SettingsTab(ttk.Frame):
             self._base_path = self.path_var_ref.get()
             self._base_retry = int(self.retry_var_ref.get())
             self._base_fallback = bool(self.fallback_var_ref.get())
+            self._base_video_quality = self.video_quality_var_ref.get()
+            self._base_cover = bool(self.cover_var_ref.get())
+            self._base_music = bool(self.music_var_ref.get())
+            self._base_avatar = bool(self.avatar_var_ref.get())
+            self._base_json = bool(self.json_var_ref.get())
+            self._base_increase = bool(self.increase_var_ref.get())
+            self._base_homepage = bool(self.homepage_screenshot_var_ref.get())
+            self._base_live_merge = bool(self.live_photo_merge_var_ref.get())
             self._lock_cookie()
             self._update_save_state()
 

@@ -7,6 +7,15 @@ from tkinter import messagebox, ttk
 from datetime import datetime
 from pathlib import Path
 
+# 数据库 aweme_type 值 → 界面中文显示
+_TYPE_LABELS = {
+    "video": "视频",
+    "gallery": "图文",
+    "music": "音乐",
+    "live": "直播",
+    "live_replay": "直播回放",
+}
+
 
 class HistoryTab(ttk.Frame):
     PAGE_SIZE = 50
@@ -31,7 +40,7 @@ class HistoryTab(ttk.Frame):
 
         ttk.Label(bar, text="类型").pack(side="left")
         self.type_var = tk.StringVar(value="全部")
-        ttk.Combobox(bar, textvariable=self.type_var, values=["全部", "视频", "图文", "音乐"],
+        ttk.Combobox(bar, textvariable=self.type_var, values=["全部", "视频", "图文", "音乐", "直播回放"],
                      state="readonly", width=8).pack(side="left", padx=(4, 12))
 
         ttk.Label(bar, text="标题").pack(side="left")
@@ -112,7 +121,8 @@ class HistoryTab(ttk.Frame):
             self._filters["author"] = author
         aweme_type = self.type_var.get().strip()
         if aweme_type and aweme_type != "全部":
-            type_map = {"视频": "video", "图文": "gallery", "音乐": "music"}
+            type_map = {"视频": "video", "图文": "gallery", "音乐": "music",
+                        "直播回放": "live_replay"}
             self._filters["aweme_type"] = type_map.get(aweme_type, aweme_type)
         title = self.title_var.get().strip()
         if title:
@@ -162,11 +172,12 @@ class HistoryTab(ttk.Frame):
         self._total = result.get("total", 0)
         for idx, row in enumerate(result.get("items", [])):
             tag = "even" if idx % 2 == 0 else "odd"
+            aweme_type = row.get("aweme_type", "")
             self.tree.insert("", "end", values=(
                 row.get("aweme_id", ""),
                 row.get("title", ""),
                 row.get("author_name", ""),
-                row.get("aweme_type", ""),
+                _TYPE_LABELS.get(aweme_type, aweme_type),
                 self._fmt_ts(row.get("create_time")),
                 self._fmt_ts(row.get("download_time")),
                 row.get("file_path", ""),
