@@ -36,6 +36,7 @@ foreach ($Dll in @("tcl86t.dll", "tk86t.dll", "sqlite3.dll", "libbz2.dll", "ffi.
     --collect-all uvicorn `
     --collect-all pydantic `
     --collect-all playwright `
+    --collect-all sv_ttk `
     --hidden-import tkinter `
     --hidden-import cli.main `
     --hidden-import core `
@@ -59,6 +60,9 @@ foreach ($Dll in @("tcl86t.dll", "tk86t.dll", "sqlite3.dll", "libbz2.dll", "ffi.
     --hidden-import gui.widgets.log_tab `
     --hidden-import gui.widgets.progress `
     --hidden-import gui.widgets.history_tab `
+    --add-data "$($Repo)\img;img" `
+    --add-data "$($Repo)\config.example.yml;." `
+    --icon (Join-Path $Repo "img\app_icon.ico") `
     @BinaryArgs `
     (Join-Path $Repo "desktop_app.py")
 

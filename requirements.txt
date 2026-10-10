@@ -11,3 +11,4 @@ imageio-ffmpeg==0.6.0
 httpx>=0.25
 pillow>=10.0
 openpyxl>=3.1
+sv-ttk>=2.6.0

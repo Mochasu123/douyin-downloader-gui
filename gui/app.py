@@ -40,6 +40,8 @@ class DouyinApp(tk.Tk):
         self.app_settings = app_settings
         self._log_expanded = False
 
+        import sv_ttk
+        sv_ttk.set_theme("light")
         apply_theme(self)
         self._set_app_icon()
 

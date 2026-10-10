@@ -70,119 +70,29 @@ def lerp_color(c1: str, c2: str, t: float) -> str:
 
 
 def apply_theme(root: tk.Tk) -> ttk.Style:
-    """Apply the blue/white theme and return the style object."""
-    root.configure(bg=BG)
+    """Apply the custom tags on top of sv-ttk."""
     style = ttk.Style(root)
-    style.theme_use("clam")
+    
+    # Fonts
+    style.configure(".", font=FONT)
+    style.configure("Treeview", font=FONT, rowheight=38)
+    style.configure("Treeview.Heading", font=FONT_BOLD)
 
-    # ── global defaults ───────────────────────────────────────────
-    style.configure(".", background=BG, foreground=TEXT, font=FONT)
-    style.configure("TFrame", background=BG)
-    style.configure("TLabel", background=BG, foreground=TEXT)
-    style.configure("Card.TFrame", background=BG_PANEL)
-    style.configure("Card.TLabel", background=BG_PANEL, foreground=TEXT)
-    style.configure("LogPanel.TFrame", background=BG_PANEL)
-
-    # ── buttons ───────────────────────────────────────────────────
-    style.configure("TButton", padding=(14, 6), relief="flat", borderwidth=0)
-    style.map("TButton",
-              background=[("active", BLUE_PALE), ("!active", BG_PANEL)],
-              foreground=[("active", BLUE), ("!active", BLUE)],
-              focuscolor=[("focus", BLUE)])
-
-    # primary (blue) action button — light blue fill, blue text
-    style.configure("Primary.TButton", background=BLUE_PALE, foreground="#1D4ED8",
-                    font=FONT_BOLD)
-    style.map("Primary.TButton",
-              background=[("active", "#BFDBFE"), ("pressed", "#93C5FD"),
-                          ("disabled", "#E2E8F0")],
-              foreground=[("active", "#1D4ED8"), ("pressed", "#1D4ED8"),
-                          ("disabled", "#94A3B8")])
-
-    # danger (stop) button — subtle red text on white
-    style.configure("Danger.TButton", background=BG_PANEL, foreground=FAILED)
-    style.map("Danger.TButton",
-              background=[("active", FAILED_BG), ("pressed", "#FEE2E2"),
-                          ("disabled", "#E2E8F0")],
-              foreground=[("active", FAILED), ("pressed", FAILED),
-                          ("disabled", "#94A3B8")])
-
-    # tool button (secondary action)
-    style.configure("Tool.TButton", padding=(8, 4), background=BG_PANEL,
-                    foreground=TEXT_MUTED)
-    style.map("Tool.TButton",
-              background=[("active", BLUE_TINT), ("!active", BG_PANEL)],
-              foreground=[("active", BLUE), ("!active", TEXT_MUTED)])
-
-    # ── progress bar (kept for ttk fallbacks; GUI uses SmoothProgressBar) ──
-    style.configure("TProgressbar", troughcolor=BORDER, background=BLUE,
-                    thickness=10)
-
-    # ── checkbutton ───────────────────────────────────────────────
-    # tk.Checkbutton is used for correct ✓ indicator (see widgets); the
-    # ttk style here only covers any stray ttk checkboxes.
-    style.configure("TCheckbutton", background=BG, foreground=TEXT)
-
-    # ── entry / combobox / spinbox ────────────────────────────────
-    style.configure("TEntry", fieldbackground=BG_PANEL, bordercolor=BORDER,
-                    borderwidth=1, relief="solid", padding=2)
-    style.map("TEntry", bordercolor=[("focus", BLUE)], fieldbackground=[("disabled", "#F1F5F9")])
-    style.configure("TCombobox", fieldbackground=BG_PANEL, bordercolor=BORDER,
-                    borderwidth=1, relief="solid", padding=2, arrowcolor=TEXT_MUTED)
-    style.map("TCombobox",
-              fieldbackground=[("readonly", BG_PANEL), ("disabled", "#F1F5F9")],
-              bordercolor=[("focus", BLUE)])
-    style.configure("TSpinbox", fieldbackground=BG_PANEL, bordercolor=BORDER,
-                    borderwidth=1, relief="solid", padding=2)
-    style.map("TSpinbox", bordercolor=[("focus", BLUE)])
-
-    # ── notebook (tabs) ───────────────────────────────────────────
-    style.configure("TNotebook", background=BG, borderwidth=0)
-    style.configure("TNotebook.Tab", padding=(20, 9), font=FONT, borderwidth=0)
-    style.map("TNotebook.Tab",
-              background=[("selected", BG_PANEL), ("!selected", BG)],
-              foreground=[("selected", BLUE), ("!selected", TEXT_MUTED)],
-              focuscolor=[("selected", BG_PANEL)])
-
-    # ── treeview (preview / history tables) ───────────────────────
-    style.configure("Treeview", font=FONT, rowheight=38,
-                    fieldbackground=BG_PANEL, background=BG_PANEL,
-                    foreground=TEXT, bordercolor=BORDER)
-    style.map("Treeview",
-              background=[("selected", BLUE)],
-              foreground=[("selected", "#FFFFFF")])
-    style.configure("Treeview.Heading", font=FONT_BOLD,
-                    background="#F8FAFC", foreground=TEXT_MUTED, relief="flat",
-                    padding=(10, 7))
-    style.map("Treeview.Heading", background=[("active", "#EEF2F7")])
+    # primary (blue) action button
+    style.configure("Primary.TButton", font=FONT_BOLD)
+    # danger (stop) button
+    style.configure("Danger.TButton", foreground=FAILED)
 
     # ── colour-coded row tags ────────────────────────────────────
-    # Success  – green
     style.configure("row_success.Treeview", background=SUCCESS_BG, foreground=SUCCESS_FG)
-    style.map("row_success.Treeview",
-              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
-    # Failed   – red
+    style.map("row_success.Treeview", background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
     style.configure("row_failed.Treeview", background=FAILED_BG, foreground=FAILED_FG)
-    style.map("row_failed.Treeview",
-              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
-    # Downloading – blue
-    style.configure("row_downloading.Treeview", background=DOWNLOADING_BG,
-                    foreground=DOWNLOADING_FG)
-    style.map("row_downloading.Treeview",
-              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
-    # Skipped – grey
+    style.map("row_failed.Treeview", background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
+    style.configure("row_downloading.Treeview", background=DOWNLOADING_BG, foreground=DOWNLOADING_FG)
+    style.map("row_downloading.Treeview", background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
     style.configure("row_skipped.Treeview", background=SKIPPED_BG, foreground=SKIPPED_FG)
-    style.map("row_skipped.Treeview",
-              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
-    # Pending – white (default)
+    style.map("row_skipped.Treeview", background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
     style.configure("row_pending.Treeview", background=PENDING_BG, foreground=PENDING_FG)
-    style.map("row_pending.Treeview",
-              background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
-
-    # ── scrollbar / separator ─────────────────────────────────────
-    style.configure("TScrollbar", background="#CBD5E1", troughcolor=BLUE_TINT,
-                    bordercolor=BLUE_TINT, arrowcolor=TEXT_MUTED, relief="flat")
-    style.map("TScrollbar", background=[("active", BLUE_SOFT)])
-    style.configure("TSeparator", background=BORDER)
+    style.map("row_pending.Treeview", background=[("selected", BLUE)], foreground=[("selected", "#FFFFFF")])
 
     return style
