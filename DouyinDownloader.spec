@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('C:\\Workspace\\CodeApply\\douyin-downloader\\img', 'img'), ('C:\\Workspace\\CodeApply\\douyin-downloader\\config.example.yml', '.')]
-binaries = [('C:\\Users\\whoca\\anaconda3\\Library\\bin\\tcl86t.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\tk86t.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\sqlite3.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\libbz2.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\ffi.dll', '.')]
-hiddenimports = ['tkinter', 'cli.main', 'core', 'core.preview_service', 'auth', 'config', 'control', 'storage', 'utils', 'tools', 'server', 'gui', 'gui.app', 'gui.controller', 'gui.theme', 'gui.widgets', 'gui.widgets.settings_tab', 'gui.widgets.link_tab', 'gui.widgets.search_tab', 'gui.widgets.preview_tab', 'gui.widgets.log_tab', 'gui.widgets.progress', 'gui.widgets.history_tab']
+datas = [('C:\\Workspace\\CodeApply\\douyin-downloader\\frontend\\dist', 'frontend/dist'), ('C:\\Workspace\\CodeApply\\douyin-downloader\\img', 'img'), ('C:\\Workspace\\CodeApply\\douyin-downloader\\config.example.yml', '.')]
+binaries = [('C:\\Users\\whoca\\anaconda3\\Library\\bin\\sqlite3.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\libbz2.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\ffi.dll', '.')]
+hiddenimports = ['cli.main', 'core', 'core.preview_service', 'core.comment_media', 'core.comment_export', 'core.live_photo', 'auth', 'config', 'control', 'storage', 'utils', 'tools', 'server', 'desktop_server', 'desktop_server.app', 'desktop_server.routes', 'desktop_server.state', 'desktop_server.events', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on']
 tmp_ret = collect_all('aiohttp')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('aiosqlite')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('httpx')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('rich')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
@@ -16,9 +18,31 @@ tmp_ret = collect_all('fastapi')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('uvicorn')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('starlette')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('websockets')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pydantic')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('playwright')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('PIL')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('openpyxl')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('imageio_ffmpeg')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('gmssl')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('webview')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('pythonnet')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('clr_loader')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('bottle')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('proxy_tools')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

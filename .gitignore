@@ -37,6 +37,8 @@ Transcripts/
 cache/
 dy_downloader.db
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
