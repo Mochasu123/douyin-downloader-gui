@@ -2,7 +2,7 @@
 
 Validates the render + validation contract used by both the downloaders
 (BaseDownloader._download_aweme_assets, MusicDownloader, LiveDownloader) and
-the desktop settings API (PATCH /api/v1/settings).
+the desktop settings API (POST /api/v1/settings).
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ def test_validate_template_accepts_defaults():
         ("a" * (MAX_TEMPLATE_LENGTH + 1) + "{id}", "<="),
         ("foo/bar_{id}", "path separators"),
         ("foo\\bar_{id}", "path separators"),
-        ("{date}_{title}", "{id}"),
         ("{unknown}_{id}", "unknown"),
         ("static_prefix", "at least one variable"),
     ],
@@ -53,9 +52,18 @@ def test_validate_template_rejects(bad: str, needle: str):
     assert needle in str(exc.value)
 
 
+def test_validate_template_allows_missing_id():
+    """{id} is no longer mandatory — users may rely on date-to-second
+    uniqueness (e.g. reproducing the legacy `YYYY-MM-DD HH.MM.SS_title_type`
+    layout). validate_template must accept id-less templates that still
+    reference at least one known variable."""
+    validate_template("{date}_{title}")
+    validate_template("{date} {hour}.{minute}.{second}_{title}_{type}")
+
+
 def test_validate_template_uses_field_name_in_error():
     with pytest.raises(TemplateValidationError) as exc:
-        validate_template("{date}", field_name="filename_template")
+        validate_template("{nope}", field_name="filename_template")
     assert "filename_template" in str(exc.value)
 
 
@@ -66,7 +74,7 @@ def test_validate_template_uses_field_name_in_error():
 
 def test_render_template_replaces_all_known_vars():
     ctx = {v: v for v in ALLOWED_VARIABLES}
-    # Use a minimal template to stay under sanitize_filename's 80-char cap.
+    # Keep each documented variable visible in one example.
     tpl = "{id}_{title}_{author}_{date}_{type}_{mode}"
     out = render_template(tpl, ctx)
     for v in ("id", "title", "author", "date", "type", "mode"):
@@ -74,13 +82,14 @@ def test_render_template_replaces_all_known_vars():
 
 
 def test_render_template_unknown_keys_render_as_empty():
+    # 空变量只留下模板里的分隔符;清洗不再折叠 / 剥掉合法的下划线。
     out = render_template("{title}_{totally_unknown}_{id}", {"title": "hi", "id": "42"})
-    assert out == "hi_42"
+    assert out == "hi__42"
 
 
 def test_render_template_missing_context_value_renders_empty():
     out = render_template("{date}_{title}_{id}", {"date": "", "title": "", "id": "42"})
-    assert out == "42"
+    assert out == "__42"
 
 
 def test_render_template_falls_back_when_result_blank():
@@ -93,11 +102,44 @@ def test_render_template_sanitizes_illegal_chars():
         "{date}_{title}_{id}",
         {"date": "2024-01-01", "title": "bad/name?*", "id": "42"},
     )
-    # Slashes, stars, question marks collapse into underscores via
-    # sanitize_filename, then consecutive underscores collapse.
+    # Slashes, stars, question marks become underscores via sanitize_filename.
     assert "/" not in out and "?" not in out and "*" not in out
     assert "42" in out
     assert "2024-01-01" in out
+
+
+def test_render_template_preserves_suffix_vars_after_long_title():
+    long_title = "很长的标题" * 20
+    out = render_template(
+        "{date}_{title}_{id}_{time}",
+        {
+            "date": "2024-07-04",
+            "title": long_title,
+            "id": "7419999999999999999",
+            "time": "0915",
+        },
+    )
+    assert len(out.encode("utf-8")) <= 239
+    assert out.endswith("_7419999999999999999_0915")
+
+
+def test_default_template_keeps_long_title_ids_unique():
+    long_title = "很长的标题" * 20
+    shared = {"date": "2024-07-04", "title": long_title}
+
+    first = render_template(
+        DEFAULT_FILE_TEMPLATE,
+        {**shared, "id": "7419999999999999991"},
+    )
+    second = render_template(
+        DEFAULT_FILE_TEMPLATE,
+        {**shared, "id": "7419999999999999992"},
+    )
+
+    assert first != second
+    assert first.endswith("_7419999999999999991")
+    assert second.endswith("_7419999999999999992")
+    assert "很长的标题" in first
 
 
 # ---------------------------------------------------------------------------

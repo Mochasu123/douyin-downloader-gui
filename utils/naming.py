@@ -1,24 +1,7 @@
 """文件/目录命名模板渲染。
 
-用户可在设置里自定义 `filename_template` 与 `folder_template`，此处把模板中
-``{var}`` 形式的占位符替换成上下文变量，未知变量会被保留成空字符串（而非抛错），
-这样即使用户输入轻微笔误也不会导致下载失败。渲染结果最终仍会走
-``utils.validators.sanitize_filename``，因此模板里出现的路径分隔符、非法字符会
-被统一清洗——模板语言本身不需要做安全校验。
-
-仅允许的变量（详见 ``ALLOWED_VARIABLES``）：
-  - ``id``: 作品 ID（视频/图集为 ``aweme_id``，音乐为 ``music_<music_id>``，
-    直播为 ``room_id``）
-  - ``title``: 作品标题或描述，空时为 ``no_title``
-  - ``author``: 作者昵称
-  - ``author_id``: 作者 sec_uid（便于同名区分，缺失为空）
-  - ``date``: 发布日期 ``YYYY-MM-DD``（缺失时为当前日期）
-  - ``year`` / ``month`` / ``day``: ``date`` 的年月日分量
-  - ``time``: 发布时间 ``HHMM``（仅当上下文提供时有值）
-  - ``hour`` / ``minute`` / ``second``: 发布时间的时/分/秒分量（两位数字）
-  - ``timestamp``: Unix 时间戳（秒，整型字符串；缺失为空）
-  - ``type``: ``video`` / ``gallery`` / ``music`` / ``live``
-  - ``mode``: 下载模式 ``post`` / ``like`` / ``mix`` / ``music`` / ``live`` …
+模板仅接受 ``ALLOWED_VARIABLES`` 中的 ``{var}`` 占位符；缺失值渲染为空字符串。
+通过 ``utils.naming_limits`` 清理非法字符并按可用长度裁短,优先保留作品 ID。
 """
 
 from __future__ import annotations
@@ -27,7 +10,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, Mapping, Optional
 
-from utils.validators import sanitize_filename
+from utils.naming_limits import PREVIEW_STEM_BYTES, fit_names
 
 # 允许用户在模板中使用的变量白名单（必须与文档、桌面 UI 帮助面板保持一致）。
 ALLOWED_VARIABLES = (
@@ -75,8 +58,11 @@ def validate_template(template: str, *, field_name: str = "template") -> None:
       - 不得只包含空白或空串
       - 至少引用一个允许变量（防止用户写成纯静态常量导致不同作品互相覆盖）
       - 引用的变量必须在 ``ALLOWED_VARIABLES`` 白名单内
-      - 必须引用 ``{id}`` —— 保证跨作品唯一性（否则同一作者同一天的两条作品
-        会因为 stem 相同而彼此覆盖）
+
+    注意：``{id}`` **不再强制**。用户可选择不含作品 ID 的模板（例如用
+    ``{date} {hour}.{minute}.{second}_{title}_{type}`` 复刻 legacy 布局）。代价是
+    基于文件名的磁盘判重会失效：默认 ``redownload_missing_files=true`` 时会再次下载；
+    关闭该开关后，才会在数据库仍有有效下载记录时继续跳过。
     """
     if not isinstance(template, str):
         raise TemplateValidationError(f"{field_name} must be a string")
@@ -107,9 +93,6 @@ def validate_template(template: str, *, field_name: str = "template") -> None:
             + f"; allowed: {', '.join(ALLOWED_VARIABLES)}"
         )
 
-    if "id" not in variables:
-        raise TemplateValidationError(f"{field_name} must reference {{id}} to guarantee uniqueness")
-
 
 def render_template(
     template: str,
@@ -120,20 +103,16 @@ def render_template(
     """根据 ``context`` 渲染模板并清洗最终文件名。
 
     未知变量或 context 缺失的键会被替换成空字符串；清洗之后若结果为空/仅
-    符号（会被 sanitize_filename 吞掉并回退为 ``untitled``），调用方可通过
+    点和空格（会被 sanitize_filename 吞掉并回退为 ``untitled``），调用方可通过
     ``fallback`` 进一步兜底。
     """
 
-    def replace(match: "re.Match[str]") -> str:
-        name = match.group(1)
-        value = context.get(name)
-        return "" if value is None else str(value)
-
-    rendered = _PLACEHOLDER_RE.sub(replace, template)
-    cleaned = sanitize_filename(rendered)
-    if cleaned == "untitled" and fallback:
-        return sanitize_filename(fallback)
-    return cleaned
+    return fit_names(
+        {"name": template},
+        context,
+        lambda names: len(names["name"].encode("utf-8")) <= PREVIEW_STEM_BYTES,
+        fallback=fallback,
+    )["name"]
 
 
 def _split_date(date_str: str) -> Dict[str, str]:

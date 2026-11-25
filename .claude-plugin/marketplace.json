@@ -1,0 +1,18 @@
+{
+  "name": "douyin-dl",
+  "description": "Free Douyin video downloader with CLI and AI Agent skill (batch download, hot board, search, live recording, transcription).",
+  "version": "2.1.1",
+  "owner": {
+    "name": "jiji262",
+    "url": "https://github.com/jiji262"
+  },
+  "plugins": [
+    {
+      "name": "douyin-dl",
+      "source": "./",
+      "description": "Free Douyin video downloader & AI agent skill. Drive douyin-dl CLI or query Douyin via agent mode.",
+      "category": "productivity",
+      "tags": ["douyin", "cli"]
+    }
+  ]
+}

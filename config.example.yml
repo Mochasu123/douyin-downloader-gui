@@ -3,10 +3,13 @@ link:
 
 path: ./Downloaded/
 
-music: true
-cover: true
-avatar: true
-json: true
+# 是否下载视频文件；关闭后仍可按下方开关保存原始封面、音乐、头像或 JSON。
+# 默认只保存视频本体，其余附带产物按需打开。
+video: true
+music: false
+cover: false
+avatar: false
+json: false
 
 start_time: ""
 end_time: ""
@@ -30,8 +33,8 @@ author_dir: "nickname"
 # 默认不下载作者主页置顶作品；如需包含置顶，改为 true
 download_pinned: false
 
-# 图集/评论区动图下载后自动合并为动态照片（华为手机可直接查看）
-live_photo_merge: true
+# 下载博主作品时，在作者根目录覆盖保存主页地址文本
+author_url: false
 
 # 下载博主作品时，在作者根目录覆盖保存一张主页首屏截图
 homepage_screenshot: false
@@ -48,12 +51,19 @@ number:
   collect: 0
   collectmix: 0
 
+# 增量任务的磁盘主文件缺失时是否重新下载：
+# true  保持当前行为，文件缺失或为空时重新下载；
+# false 数据库仍有有效下载记录时跳过（数据库不可用或记录已删除时仍会下载）。
+redownload_missing_files: true
+
+# 各模式是否启用增量下载：true 跳过已判定为下载过的作品；
+# false 重新下载并覆盖当前筛选范围内的作品。
 increase:
-  post: false
-  like: false
-  allmix: false
-  mix: false
-  music: false
+  post: true
+  like: true
+  allmix: true
+  mix: true
+  music: true
 
 thread: 5
 retry_times: 3
@@ -62,7 +72,12 @@ database: true
 database_path: dy_downloader.db
 
 # 视频下载画质。抖音 API 为每个视频返回多档码率，此选项决定选用哪一档：
-#   highest                  - 最高可用档（默认，与历史行为一致）
+#   original                 - 原画：探测上传原片（转码档列表之外，可比最高
+#                              转码档大数倍），比转码档大则优先下载原片，探测
+#                              失败时退回最高转码档。代价是每条作品多一次探测
+#                              请求（超时 10s）
+#   highest                  - 最高转码档（默认）：只在 bit_rate 阶梯里挑，
+#                              不发探测请求
 #   lowest                   - 最低可用档（省流量）
 #   1440p / 1080p / 720p / 540p / 480p / 360p
 #                            - 指定分辨率，匹配不到时自动降级到最接近的可用档
@@ -91,6 +106,8 @@ browser_fallback:
   wait_timeout_seconds: 600
 
 # 评论采集（可选）：启用后每个作品会额外生成 *_comments.json
+# 评论请求同样受 rate_limit 限速。请求失败（如被限流）时不写空文件，只取到一部分的
+# 标 "complete": false；之后再跑同一链接，会给已下载的作品补抓缺的评论。
 comments:
   enabled: false
   include_replies: false
@@ -101,6 +118,7 @@ comments:
 live:
   max_duration_seconds: 0   # 0 = 录到主播下播
   chunk_size: 65536
+  segment_seconds: 3600    # 持续连接分段；分段完成后自动转 MP4
   idle_timeout_seconds: 30
 
 # 下载完成通知（可选）。providers 支持 bark / telegram / webhook

@@ -126,6 +126,90 @@ async def test_custom_filename_template_applies(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["collect", "collectmix"])
+async def test_self_collect_names_files_by_each_works_author(tmp_path, monkeypatch, mode):
+    """#253：下载自己的收藏时目录仍归到 self/<mode>/，但文件名模板里的
+    {author} / {author_id} 要取作品自己的作者，而不是全部填成 self。"""
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=False,
+        filename_template="{author}_{author_id}_{id}",
+    )
+
+    saved = []
+
+    async def _fake_download(self, _url, save_path, _session, **_):
+        saved.append(save_path)
+        return True
+
+    downloader._download_with_retry = _fake_download.__get__(downloader, VideoDownloader)
+
+    async def _fake_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_session)
+
+    publish_ts = int(datetime(2024, 7, 4, 9, 15).timestamp())
+    aweme = _make_aweme(publish_ts, aweme_id="7419999999999999998")
+
+    assert (
+        await downloader._download_aweme_assets(
+            aweme, author_name="self", mode=mode, author_sec_uid="MS4wLjABAAAviewer"
+        )
+        is True
+    )
+
+    assert len(saved) == 1
+    assert saved[0].name == "爬山佬_MS4wLjABAAA_7419999999999999998.mp4"
+    assert saved[0].parent == tmp_path / "self" / mode
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_custom_filename_template_includes_time_after_long_title(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=True,
+        filename_template="{date}_{title}_{id}_{time}",
+        folder_template="{date}_{title}_{id}_{time}",
+    )
+
+    saved = []
+
+    async def _fake_download(self, _url, save_path, _session, **_):
+        saved.append(save_path)
+        return True
+
+    downloader._download_with_retry = _fake_download.__get__(downloader, VideoDownloader)
+
+    async def _fake_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_session)
+
+    publish_ts = int(datetime(2024, 7, 4, 9, 15).timestamp())
+    aweme = _make_aweme(publish_ts, aweme_id="7419999999999999999")
+    aweme["desc"] = "很长的标题" * 20
+
+    assert await downloader._download_aweme_assets(aweme, author_name="爬山佬", mode="post") is True
+
+    save_path = saved[0]
+    assert save_path.name.endswith("_7419999999999999999_0915.mp4")
+    assert save_path.parent.name.endswith("_7419999999999999999_0915")
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
 async def test_folderstyle_false_skips_subdirectory(tmp_path, monkeypatch):
     downloader, api_client = _build_downloader(tmp_path)
     downloader.config.update(
@@ -159,5 +243,84 @@ async def test_folderstyle_false_skips_subdirectory(tmp_path, monkeypatch):
     save_path = saved[0]
     assert save_path.parent.name == "post"
     assert save_path.parent.parent.name == "爬山佬"
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_group_by_mode_false_flattens_mode_dir(tmp_path, monkeypatch):
+    """group_by_mode=False + folderstyle=False writes straight into the author
+    directory — no ``post`` (mode) folder, no per-aweme subfolder."""
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=False,
+        group_by_mode=False,
+    )
+
+    saved = []
+
+    async def _fake_download(self, _url, save_path, _session, **_):
+        saved.append(save_path)
+        return True
+
+    downloader._download_with_retry = _fake_download.__get__(downloader, VideoDownloader)
+
+    async def _fake_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_session)
+
+    publish_ts = int(datetime(2024, 1, 1, 0, 0).timestamp())
+    aweme = _make_aweme(publish_ts, aweme_id="7401010101010101010")
+
+    assert await downloader._download_aweme_assets(aweme, author_name="爬山佬", mode="post") is True
+
+    save_path = saved[0]
+    assert "post" not in save_path.parts
+    assert save_path.parent.name == "爬山佬"
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_template_without_id_reproduces_legacy_name(tmp_path, monkeypatch):
+    """An id-less template using date + HH.MM.SS reproduces the legacy
+    DouYin-Downloader filename ``YYYY-MM-DD HH.MM.SS_title_type``."""
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=False,
+        group_by_mode=False,
+        filename_template="{date} {hour}.{minute}.{second}_{title}_{type}",
+    )
+
+    saved = []
+
+    async def _fake_download(self, _url, save_path, _session, **_):
+        saved.append(save_path)
+        return True
+
+    downloader._download_with_retry = _fake_download.__get__(downloader, VideoDownloader)
+
+    async def _fake_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_session)
+
+    publish_ts = int(datetime(2018, 9, 17, 18, 24, 50).timestamp())
+    aweme = _make_aweme(publish_ts, aweme_id="6601234567890123456")
+    aweme["desc"] = "土味情话"
+
+    assert await downloader._download_aweme_assets(aweme, author_name="爬山佬", mode="post") is True
+
+    save_path = saved[0]
+    assert save_path.name == "2018-09-17 18.24.50_土味情话_video.mp4"
 
     await api_client.close()

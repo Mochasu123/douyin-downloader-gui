@@ -253,3 +253,233 @@ async def test_database_get_conn_reuses_single_connection_under_concurrency(tmp_
     assert connect_calls == [str(tmp_path / "test.db")]
 
     await database.close()
+
+
+# ---------------------------------------------------------------------------
+# Preserving upsert semantics (page-review-improvements Task 3)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_add_aweme_preserves_downloaded_fields_on_sync_upsert(tmp_path):
+    database = Database(str(tmp_path / "test.db"))
+    await database.initialize()
+
+    await database.add_aweme(
+        {
+            "aweme_id": "A1",
+            "aweme_type": "video",
+            "title": "old",
+            "file_path": "/tmp/a1.mp4",
+            "metadata": '{"k":1}',
+            "cover_urls": '["https://p9/c.jpg"]',
+        }
+    )
+    # my-content sync writes an empty projection for the same aweme —
+    # it must NOT clobber the download fields.
+    await database.add_aweme(
+        {
+            "aweme_id": "A1",
+            "aweme_type": "video",
+            "title": "new",
+            "file_path": "",
+            "metadata": "",
+        }
+    )
+
+    db = await database._get_conn()
+    cursor = await db.execute(
+        "SELECT title, file_path, metadata, cover_urls FROM aweme WHERE aweme_id = ?",
+        ("A1",),
+    )
+    row = await cursor.fetchone()
+    assert row == ("new", "/tmp/a1.mp4", '{"k":1}', '["https://p9/c.jpg"]')
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_add_aweme_download_time_only_set_by_real_downloads(tmp_path):
+    database = Database(str(tmp_path / "test.db"))
+    await database.initialize()
+
+    # Sync-only insert: no file_path → download_time stays NULL.
+    await database.add_aweme(
+        {"aweme_id": "L1", "aweme_type": "video", "title": "liked", "file_path": "", "metadata": ""}
+    )
+    db = await database._get_conn()
+    cursor = await db.execute("SELECT download_time FROM aweme WHERE aweme_id = ?", ("L1",))
+    (dt,) = await cursor.fetchone()
+    assert dt is None
+
+    # Real download later: download_time gets stamped.
+    await database.add_aweme(
+        {
+            "aweme_id": "L1",
+            "aweme_type": "video",
+            "title": "liked",
+            "file_path": "/tmp/l1.mp4",
+            "metadata": "",
+        }
+    )
+    cursor = await db.execute("SELECT download_time FROM aweme WHERE aweme_id = ?", ("L1",))
+    (dt2,) = await cursor.fetchone()
+    assert isinstance(dt2, int) and dt2 > 0
+
+    # A later sync upsert must not erase the stamp.
+    await database.add_aweme(
+        {"aweme_id": "L1", "aweme_type": "video", "title": "liked", "file_path": "", "metadata": ""}
+    )
+    cursor = await db.execute(
+        "SELECT download_time, file_path FROM aweme WHERE aweme_id = ?", ("L1",)
+    )
+    row = await cursor.fetchone()
+    assert row == (dt2, "/tmp/l1.mp4")
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_add_aweme_batch_preserves_download_fields_on_empty_payload(tmp_path):
+    database = Database(str(tmp_path / "test.db"))
+    await database.initialize()
+
+    await database.add_aweme(
+        {
+            "aweme_id": "B1",
+            "aweme_type": "video",
+            "title": "old",
+            "file_path": "/tmp/b1.mp4",
+            "metadata": '{"m":1}',
+        }
+    )
+    await database.add_aweme_batch(
+        [{"aweme_id": "B1", "aweme_type": "video", "title": "new", "file_path": "", "metadata": ""}]
+    )
+
+    db = await database._get_conn()
+    cursor = await db.execute(
+        "SELECT title, file_path, metadata FROM aweme WHERE aweme_id = ?", ("B1",)
+    )
+    row = await cursor.fetchone()
+    assert row == ("new", "/tmp/b1.mp4", '{"m":1}')
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_add_aweme_preserves_author_sec_uid_against_empty_string(tmp_path):
+    """Sync payloads use the empty-string convention for missing sec_uid;
+    the preserving upsert must not let '' clobber a real stored value
+    (review finding: Following→History cross-link would break)."""
+    database = Database(str(tmp_path / "test.db"))
+    await database.initialize()
+
+    await database.add_aweme(
+        {
+            "aweme_id": "S1",
+            "aweme_type": "video",
+            "title": "t",
+            "file_path": "/tmp/s.mp4",
+            "metadata": "",
+            "author_sec_uid": "SEC_REAL",
+        }
+    )
+    await database.add_aweme(
+        {
+            "aweme_id": "S1",
+            "aweme_type": "video",
+            "title": "t2",
+            "file_path": "",
+            "metadata": "",
+            "author_sec_uid": "",
+        }
+    )
+    db = await database._get_conn()
+    cursor = await db.execute("SELECT author_sec_uid FROM aweme WHERE aweme_id = ?", ("S1",))
+    (sec,) = await cursor.fetchone()
+    assert sec == "SEC_REAL"
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_is_downloaded_and_latest_time_ignore_sync_only_rows(tmp_path):
+    """Liked-but-never-downloaded rows must not count as downloaded nor
+    poison the author increment baseline (review finding: like-mode
+    incremental batches would stop at the first synced row)."""
+    database = Database(str(tmp_path / "test.db"))
+    await database.initialize()
+
+    await database.add_aweme(
+        {
+            "aweme_id": "SYNC1",
+            "aweme_type": "video",
+            "title": "liked",
+            "author_id": "AUTH",
+            "create_time": 9_999,
+            "file_path": "",
+            "metadata": "",
+        }
+    )
+    assert await database.is_downloaded("SYNC1") is False
+    assert await database.get_latest_aweme_time("AUTH") is None
+
+    await database.add_aweme(
+        {
+            "aweme_id": "DL1",
+            "aweme_type": "video",
+            "title": "dl",
+            "author_id": "AUTH",
+            "create_time": 5_000,
+            "file_path": "/tmp/d.mp4",
+            "metadata": "",
+        }
+    )
+    assert await database.is_downloaded("DL1") is True
+    assert await database.get_latest_aweme_time("AUTH") == 5_000
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_add_aweme_empty_payload_fields_do_not_regress_row(tmp_path):
+    """Sync projections may lack create_time/title/aweme_type — the
+    preserving upsert must not blank or zero real values (review Minor)."""
+    database = Database(str(tmp_path / "test.db"))
+    await database.initialize()
+
+    await database.add_aweme(
+        {
+            "aweme_id": "R1",
+            "aweme_type": "gallery",
+            "title": "真标题",
+            "author_id": "AUTH",
+            "author_name": "作者甲",
+            "create_time": 1_700_000_000,
+            "file_path": "/tmp/r.mp4",
+            "metadata": "",
+        }
+    )
+    # Degenerate sync upsert: everything empty/zero.
+    await database.add_aweme(
+        {
+            "aweme_id": "R1",
+            "aweme_type": "",
+            "title": "",
+            "author_id": "",
+            "author_name": "",
+            "create_time": 0,
+            "file_path": "",
+            "metadata": "",
+        }
+    )
+
+    db = await database._get_conn()
+    cursor = await db.execute(
+        "SELECT aweme_type, title, author_id, author_name, create_time "
+        "FROM aweme WHERE aweme_id = ?",
+        ("R1",),
+    )
+    row = await cursor.fetchone()
+    assert row == ("gallery", "真标题", "AUTH", "作者甲", 1_700_000_000)
+
+    await database.close()

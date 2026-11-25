@@ -5,21 +5,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from core import item_reasons
 from core.downloader_base import BaseDownloader, DownloadResult
+from core.ffmpeg import resolve_ffmpeg_path
+from core.metadata import build_author_home_url, extract_author_sec_uid
+from core.output_naming import plan_output_paths
 from utils.logger import setup_logger
-from utils.naming import (
-    DEFAULT_FILE_TEMPLATE,
-    DEFAULT_FOLDER_TEMPLATE,
-    build_live_context,
-    render_template,
-)
+from utils.naming import build_live_context
 
 logger = setup_logger("LiveReplayDownloader")
+LIVE_REPLAY_TIMEZONE = timezone(timedelta(hours=8))
+_REMUX_TIMEOUT_SECONDS = 600.0
+_PROCESS_REAP_TIMEOUT_SECONDS = 5.0
 
 
 class LiveReplayDownloader(BaseDownloader):
@@ -32,7 +33,9 @@ class LiveReplayDownloader(BaseDownloader):
         if not episode_id:
             logger.error("No episode_id found in parsed URL")
             result.failed += 1
-            self._progress_advance_item("failed", "missing episode_id")
+            self._progress_advance_item(
+                "failed", "missing episode_id", item_reasons.FAIL_REPLAY_MISSING_ID
+            )
             return result
 
         self._progress_update_step("获取回放信息", f"episode_id={episode_id}")
@@ -40,28 +43,33 @@ class LiveReplayDownloader(BaseDownloader):
         if not episode:
             logger.error("Live replay episode not found: %s", episode_id)
             result.failed += 1
-            self._progress_advance_item("failed", episode_id)
+            self._progress_advance_item("failed", episode_id, item_reasons.FAIL_REPLAY_NOT_FOUND)
             return result
 
         room_id = str(episode.get("attach_room_id_str") or episode.get("attach_room_id") or "")
         if not room_id:
             logger.error("Live replay room_id missing: %s", episode_id)
             result.failed += 1
-            self._progress_advance_item("failed", episode_id)
+            self._progress_advance_item("failed", episode_id, item_reasons.FAIL_REPLAY_NO_ROOM)
             return result
 
-        replay = await self.api_client.get_live_replay_info(episode_id, room_id)
+        replay_id = str(parsed_url.get("replay_id") or "").strip() or None
+        replay = await self.api_client.get_live_replay_info(
+            episode_id, room_id, replay_id=replay_id
+        )
         if not replay:
             logger.error("Live replay playable info not found: %s", episode_id)
             result.failed += 1
-            self._progress_advance_item("failed", episode_id)
+            self._progress_advance_item("failed", episode_id, item_reasons.FAIL_REPLAY_NO_PLAYBACK)
             return result
 
         video_url, audio_url = self._select_playback_tracks(self._play_urls(replay))
         if not video_url:
             logger.error("No playable live replay video URL: %s", episode_id)
             result.failed += 1
-            self._progress_advance_item("failed", episode_id)
+            self._progress_advance_item(
+                "failed", episode_id, item_reasons.FAIL_REPLAY_NO_VIDEO_TRACK
+            )
             return result
 
         save_dir, file_stem = self._plan_output_paths(episode, replay, episode_id)
@@ -69,36 +77,52 @@ class LiveReplayDownloader(BaseDownloader):
         video_path = save_dir / f"{file_stem}.video.mp4"
         audio_path = save_dir / f"{file_stem}.audio.mp4"
 
+        if self.progress_reporter:
+            emit_start = getattr(self.progress_reporter, "on_item_start", None)
+            if callable(emit_start):
+                try:
+                    emit_start(aweme_id=episode_id, index=0, total=1, title=final_path.name)
+                except Exception as exc:
+                    logger.debug("Progress on_item_start failed: %s", exc)
+
         self._progress_update_step("下载回放视频", final_path.name)
-        if not await self._download_track(video_url, video_path):
+        if not await self._download_track(video_url, video_path, aweme_id=episode_id):
             result.failed += 1
-            self._progress_advance_item("failed", episode_id)
+            self._progress_advance_item("failed", episode_id, item_reasons.FAIL_REPLAY_VIDEO_TRACK)
             return result
 
-        output_ok = False
+        output_paths: List[Path]
+        remux_status = "merged"
         if audio_url:
             self._progress_update_step("下载回放音频", final_path.name)
-            if not await self._download_track(audio_url, audio_path):
-                self._cleanup_temp(video_path, audio_path)
-                result.failed += 1
-                self._progress_advance_item("failed", episode_id)
-                return result
-            self._progress_update_step("合并音视频", final_path.name)
-            output_ok = await self._remux_tracks(video_path, audio_path, final_path)
+            if not await self._download_track(audio_url, audio_path, aweme_id=episode_id):
+                logger.warning(
+                    "Live replay audio download failed; keeping video track: %s", episode_id
+                )
+                output_paths = [video_path]
+                remux_status = "audio_download_failed"
+            else:
+                self._progress_update_step("合并音视频", final_path.name)
+                if await self._remux_tracks(video_path, audio_path, final_path):
+                    self._cleanup_temp(video_path, audio_path)
+                    output_paths = [final_path]
+                else:
+                    logger.warning(
+                        "Live replay remux failed or ffmpeg missing; keeping separate tracks: %s",
+                        episode_id,
+                    )
+                    output_paths = [video_path, audio_path]
+                    remux_status = "remux_failed"
         else:
             os.replace(str(video_path), str(final_path))
-            output_ok = True
+            output_paths = [final_path]
+            remux_status = "video_only"
 
-        if output_ok:
-            self._cleanup_temp(video_path, audio_path)
-            await self._record_outputs(episode, replay, episode_id, room_id, save_dir, final_path)
-            result.success += 1
-            self._progress_advance_item("success", episode_id)
-        else:
-            self._cleanup_temp(video_path, audio_path)
-            result.failed += 1
-            self._progress_advance_item("failed", episode_id)
-
+        await self._record_outputs(
+            episode, replay, episode_id, room_id, save_dir, output_paths, remux_status
+        )
+        result.success += 1
+        self._progress_advance_item("success", episode_id)
         return result
 
     @staticmethod
@@ -109,7 +133,9 @@ class LiveReplayDownloader(BaseDownloader):
         return [item for item in play_urls or [] if isinstance(item, dict)]
 
     @staticmethod
-    def _select_playback_tracks(play_urls: Iterable[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    def _select_playback_tracks(
+        play_urls: Iterable[Dict[str, Any]],
+    ) -> Tuple[Optional[str], Optional[str]]:
         video_candidates = []
         audio_url: Optional[str] = None
         for item in play_urls:
@@ -149,7 +175,6 @@ class LiveReplayDownloader(BaseDownloader):
         owner = episode.get("owner") if isinstance(episode.get("owner"), dict) else {}
         author_name = str(owner.get("nickname") or "unknown").strip() or "unknown"
         started_at = self._started_at(episode)
-        date = started_at.strftime("%Y-%m-%d_%H%M")
         context = build_live_context(
             room_id=episode_id,
             title=title,
@@ -157,21 +182,14 @@ class LiveReplayDownloader(BaseDownloader):
             started_at=started_at,
             mode="live_replay",
         )
-        filename_template = self.config.get("filename_template") or DEFAULT_FILE_TEMPLATE
-        folder_template = self.config.get("folder_template") or DEFAULT_FOLDER_TEMPLATE
-        file_stem = render_template(filename_template, context, fallback=f"{date}_{episode_id}")
-        folder_name = render_template(folder_template, context, fallback=f"{date}_{episode_id}")
-        save_dir = self.file_manager.get_save_path(
-            author_name=author_name,
+        # 让「打开输出文件夹」落到该作者目录而不是下载根目录。
+        author_dir_style = self.config.get("author_dir") or "nickname"
+        self._report_author_output_dir(author_name, None, author_dir_style)
+        save_dir, file_stem = plan_output_paths(
+            file_manager=self.file_manager,
+            config=self.config,
+            context=context,
             mode="live_replay",
-            aweme_title=title,
-            aweme_id=episode_id,
-            folderstyle=self.config.get("folderstyle", True),
-            download_date=date,
-            folder_name=folder_name,
-            author_sec_uid=None,
-            author_dir_style=self.config.get("author_dir") or "nickname",
-            group_by_mode=self.config.get("group_by_mode", True),
         )
         return save_dir, file_stem
 
@@ -180,11 +198,13 @@ class LiveReplayDownloader(BaseDownloader):
         extra = episode.get("episode_extra_basic_info")
         ts = extra.get("room_start_time") if isinstance(extra, dict) else None
         try:
-            return datetime.fromtimestamp(int(ts or 0)) if ts else datetime.now()
+            if ts:
+                return datetime.fromtimestamp(int(ts), tz=LIVE_REPLAY_TIMEZONE)
+            return datetime.now(LIVE_REPLAY_TIMEZONE)
         except (OSError, OverflowError, TypeError, ValueError):
-            return datetime.now()
+            return datetime.now(LIVE_REPLAY_TIMEZONE)
 
-    async def _download_track(self, url: str, target_path: Path) -> bool:
+    async def _download_track(self, url: str, target_path: Path, *, aweme_id: str) -> bool:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         session = await self.api_client.get_session()
         return bool(
@@ -193,15 +213,16 @@ class LiveReplayDownloader(BaseDownloader):
                 target_path,
                 session,
                 headers=self._download_headers(),
+                on_progress=self._make_item_progress(aweme_id),
             )
         )
 
     async def _remux_tracks(self, video_path: Path, audio_path: Path, output_path: Path) -> bool:
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = resolve_ffmpeg_path()
         if not ffmpeg:
             logger.error("ffmpeg not found; cannot merge live replay tracks")
             return False
-        tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+        tmp_path = output_path.with_suffix(f".tmp{output_path.suffix}")
         cmd = [
             ffmpeg,
             "-y",
@@ -213,21 +234,50 @@ class LiveReplayDownloader(BaseDownloader):
             "copy",
             str(tmp_path),
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.error("ffmpeg merge failed: %s", stderr.decode("utf-8", "ignore")[-500:])
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_REMUX_TIMEOUT_SECONDS
+            )
+            if proc.returncode != 0:
+                logger.error("ffmpeg merge failed: %s", stderr.decode("utf-8", "ignore")[-500:])
+                return False
+            os.replace(str(tmp_path), str(output_path))
+            return True
+        except asyncio.TimeoutError:
+            logger.error("ffmpeg merge timed out after %ss", int(_REMUX_TIMEOUT_SECONDS))
+            if proc is not None:
+                await self._kill_and_reap(proc)
             return False
-        os.replace(str(tmp_path), str(output_path))
-        return True
+        except asyncio.CancelledError:
+            if proc is not None:
+                await self._kill_and_reap(proc)
+            raise
+        except Exception as exc:
+            logger.error("ffmpeg merge failed: %s", exc)
+            if proc is not None:
+                await self._kill_and_reap(proc)
+            return False
+        finally:
+            self._cleanup_temp(tmp_path)
+
+    @staticmethod
+    async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.warning("Failed to kill ffmpeg pid=%s: %s", proc.pid, exc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.warning("Failed to reap ffmpeg pid=%s: %s", proc.pid, exc)
 
     @staticmethod
     def _cleanup_temp(*paths: Path) -> None:
@@ -244,12 +294,23 @@ class LiveReplayDownloader(BaseDownloader):
         episode_id: str,
         room_id: str,
         save_dir: Path,
-        final_path: Path,
+        output_paths: List[Path],
+        remux_status: str,
     ) -> None:
         title = str(replay.get("title") or episode.get("title") or "直播回放")
         owner = episode.get("owner") if isinstance(episode.get("owner"), dict) else {}
         author_name = str(owner.get("nickname") or "unknown")
-        metadata_json = json.dumps({"episode": episode, "replay": replay}, ensure_ascii=False)
+        # `owner` is the author block for a replay episode; reuse the shared
+        # extractor so the trim / type defences stay in one place. Live replay
+        # payloads have not been observed carrying sec_uid, so this usually
+        # resolves to None — the DB column then stores NULL (same as the video
+        # and music paths) and the manifest records "" like any other unknown
+        # author.
+        owner_sec_uid = extract_author_sec_uid({"author": owner})
+        metadata_json = json.dumps(
+            {"episode": episode, "replay": replay, "remux_status": remux_status},
+            ensure_ascii=False,
+        )
         if self.database:
             await self.database.add_aweme(
                 {
@@ -261,7 +322,7 @@ class LiveReplayDownloader(BaseDownloader):
                     "create_time": int(self._started_at(episode).timestamp()),
                     "file_path": str(save_dir),
                     "metadata": metadata_json,
-                    "author_sec_uid": "",
+                    "author_sec_uid": owner_sec_uid,
                     "cover_urls": json.dumps([]),
                     "job_id": self.job_id or "",
                 }
@@ -272,12 +333,17 @@ class LiveReplayDownloader(BaseDownloader):
                 "date": self._started_at(episode).strftime("%Y-%m-%d_%H%M"),
                 "aweme_id": episode_id,
                 "author_name": author_name,
+                "author_sec_uid": owner_sec_uid or "",
+                "author_url": build_author_home_url(owner_sec_uid) or "",
                 "desc": title,
                 "media_type": "live_replay",
                 "mode": "live_replay",
                 "room_id": room_id,
-                "file_names": [final_path.name],
-                "file_paths": [str(final_path.relative_to(self.file_manager.base_path))],
+                "file_names": [path.name for path in output_paths],
+                "file_paths": [
+                    str(path.relative_to(self.file_manager.base_path)) for path in output_paths
+                ],
+                "remux_status": remux_status,
                 "metadata": metadata_json,
             },
         )

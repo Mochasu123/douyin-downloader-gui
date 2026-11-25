@@ -7,8 +7,8 @@ from auth import CookieManager
 from core import LoginRequiredError
 
 
-def _mk_cm(tmp_path):
-    cm = CookieManager(str(tmp_path / ".cookies.json"))
+def _mk_cm():
+    cm = CookieManager()
     # Seed a stale key that the fresh login does NOT return, to prove the
     # refresh is a clean replace (not a merge that leaves stale keys behind).
     cm.set_cookies({"sessionid": "old", "stale_csrf": "X"})
@@ -16,8 +16,8 @@ def _mk_cm(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_retries_once_after_relogin(monkeypatch, tmp_path):
-    cm = _mk_cm(tmp_path)
+async def test_retries_once_after_relogin(monkeypatch):
+    cm = _mk_cm()
     calls = {"n": 0}
 
     async def make_coro():
@@ -42,8 +42,8 @@ async def test_retries_once_after_relogin(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_non_interactive_does_not_relogin(monkeypatch, tmp_path):
-    cm = _mk_cm(tmp_path)
+async def test_non_interactive_does_not_relogin(monkeypatch):
+    cm = _mk_cm()
     called = {"relogin": False}
 
     async def make_coro():
@@ -62,8 +62,8 @@ async def test_non_interactive_does_not_relogin(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_gives_up_when_relogin_fails(monkeypatch, tmp_path):
-    cm = _mk_cm(tmp_path)
+async def test_gives_up_when_relogin_fails(monkeypatch):
+    cm = _mk_cm()
 
     async def make_coro():
         raise LoginRequiredError(2483, "请先登录", "/search")

@@ -10,37 +10,6 @@ def test_parse_video_url():
     assert parsed["aweme_id"] == "7320876060210373923"
 
 
-def test_parse_jingxuan_modal_id_url():
-    # 精选页弹窗链接：/jingxuan?modal_id=xxx，应识别为单个作品
-    url = "https://www.douyin.com/jingxuan?modal_id=7668679715758153713"
-    parsed = URLParser.parse(url)
-
-    assert parsed is not None
-    assert parsed["type"] == "video"
-    assert parsed["aweme_id"] == "7668679715758153713"
-
-
-def test_parse_modal_id_on_any_douyin_page():
-    # modal_id 表示任意页面上弹窗打开的单个作品，均应优先按视频解析
-    for path in ("discover", "search", "root", "user/MS4wLjABAAAA"):
-        url = f"https://www.douyin.com/{path}?modal_id=7668679715758153713"
-        parsed = URLParser.parse(url)
-        assert parsed is not None, url
-        assert parsed["type"] == "video", url
-        assert parsed["aweme_id"] == "7668679715758153713", url
-
-
-def test_extract_url_from_share_text():
-    from utils.validators import extract_url_from_line
-
-    line = "8.88 复制打开抖音，看看 https://v.douyin.com/ab12cd/ 的精彩内容"
-    assert extract_url_from_line(line) == "https://v.douyin.com/ab12cd/"
-    plain = "https://www.douyin.com/jingxuan?modal_id=7668679715758153713"
-    assert extract_url_from_line(plain) == plain
-    assert extract_url_from_line("这条没有链接") is None
-    assert extract_url_from_line("") is None
-
-
 def test_parse_gallery_url_sets_aweme_id():
     url = "https://www.douyin.com/note/7320876060210373923"
     parsed = URLParser.parse(url)
@@ -84,6 +53,40 @@ def test_parse_unsupported_url_returns_none():
     assert URLParser.parse(url) is None
 
 
+def test_parse_lvdetail_url_is_recognised_but_gated():
+    # 放映厅版权影视：识别出来是为了给用户一条明确的「为什么下不了」，
+    # 不是 None（那只会显示通用的「无法识别该链接」）。
+    parsed = URLParser.parse("https://www.douyin.com/lvdetail/6828500371023856142")
+
+    assert parsed is not None
+    assert parsed["type"] == "lvdetail"
+
+
+def test_parse_lvdetail_url_keeps_query_params():
+    parsed = URLParser.parse(
+        "https://www.douyin.com/lvdetail/6828500371023856142"
+        "?previous_page_enter_method=live_cover&previous_page_sub_tab=movie"
+    )
+
+    assert parsed is not None
+    assert parsed["type"] == "lvdetail"
+
+
+def test_parse_lvdetail_modal_id_keeps_video_priority():
+    # 在放映厅页面上弹窗看某条普通作品时，该作品才是下载目标。
+    parsed = URLParser.parse(
+        "https://www.douyin.com/lvdetail/6828500371023856142?modal_id=7412345678901234567"
+    )
+
+    assert parsed is not None
+    assert parsed["type"] == "video"
+    assert parsed["aweme_id"] == "7412345678901234567"
+
+
+def test_parse_lvdetail_rejects_spoofed_host():
+    assert URLParser.parse("https://evil.com/lvdetail/6828500371023856142") is None
+
+
 def test_parse_short_url_marks_as_short():
     # 短链在 parser 层统一标记为 'short'，交由 CLI 预先解析真实链接。
     for url in (
@@ -109,6 +112,37 @@ def test_parse_live_url():
     assert parsed["room_id"] == "987654321"
 
 
+def test_parse_live_url_modal_id_keeps_video_priority():
+    parsed = URLParser.parse("https://live.douyin.com/123456789?modal_id=7412345678901234567")
+
+    assert parsed is not None
+    assert parsed["type"] == "video"
+    assert parsed["aweme_id"] == "7412345678901234567"
+
+
+def test_parse_live_url_rejects_non_exact_paths():
+    for url in (
+        "https://live.douyin.com/",
+        "https://live.douyin.com/not-a-room",
+        "https://live.douyin.com/123456789/extra",
+        "https://live.douyin.com/123456789%2Fextra",
+    ):
+        assert URLParser.parse(url) is None, url
+
+
+def test_parse_live_reflow_share_url():
+    parsed = URLParser.parse(
+        "https://webcast.amemv.com/douyin/webcast/reflow/7664563379964595007"
+        "?sec_user_id=MS4wLjABAAAA-test"
+    )
+
+    assert parsed is not None
+    assert parsed["type"] == "live"
+    assert parsed["room_id"] == "7664563379964595007"
+    assert parsed["room_id_kind"] == "room_id"
+    assert parsed["sec_user_id"] == "MS4wLjABAAAA-test"
+
+
 def test_parse_live_replay_vsdetail_url():
     parsed = URLParser.parse("https://www.douyin.com/vsdetail/7331203341890049058")
 
@@ -126,3 +160,53 @@ def test_parse_live_replay_reflow_share_url():
     assert parsed is not None
     assert parsed["type"] == "live_replay"
     assert parsed["episode_id"] == "7331203341890049058"
+
+
+def test_parse_live_replay_uses_replay_id_when_present():
+    parsed = URLParser.parse(
+        "https://webcast.amemv.com/douyin/webcast/reflow/episode/"
+        "7331203341890049058?replay_id=7339999999999999999"
+    )
+
+    assert parsed is not None
+    assert parsed["type"] == "live_replay"
+    assert parsed["episode_id"] == "7331203341890049058"
+    assert parsed["replay_id"] == "7339999999999999999"
+
+
+def test_parse_live_replay_rejects_spoofed_host():
+    assert (
+        URLParser.parse("https://evil.com/douyin/webcast/reflow/episode/7331203341890049058")
+        is None
+    )
+
+
+def test_parse_live_replay_rejects_unapproved_amemv_subdomain():
+    assert (
+        URLParser.parse("https://foo.amemv.com/douyin/webcast/reflow/episode/7331203341890049058")
+        is None
+    )
+
+
+def test_parse_live_replay_rejects_non_exact_paths():
+    assert (
+        URLParser.parse(
+            "https://webcast.amemv.com/foo/douyin/webcast/reflow/episode/7331203341890049058"
+        )
+        is None
+    )
+    assert URLParser.parse("https://www.douyin.com/foo/vsdetail/7331203341890049058") is None
+    assert URLParser.parse("https://www.douyin.com/vsdetail/7331203341890049058/extra") is None
+    assert (
+        URLParser.parse(
+            "https://webcast.amemv.com/douyin/webcast/reflow/episode/7331203341890049058/extra"
+        )
+        is None
+    )
+
+
+def test_parse_webcast_non_replay_path_is_unsupported():
+    assert URLParser.parse("https://webcast.amemv.com/video/7331203341890049058") is None
+    assert URLParser.parse("https://webcast.amemv.com/?modal_id=7331203341890049058") is None
+    assert URLParser.parse("https://webcast.amemv.com/douyin/webcast/reflow/not-a-room") is None
+    assert URLParser.parse("https://webcast.amemv.com/douyin/webcast/reflow/733/extra") is None

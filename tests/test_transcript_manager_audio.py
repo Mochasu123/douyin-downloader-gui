@@ -14,6 +14,7 @@ spec and exercises the older paths). New behaviour covered here:
 - ``_resolve_api_key`` priority (env → settings → none).
 - Property 2 (api_key never appears in logs).
 """
+
 from __future__ import annotations
 
 import logging
@@ -179,9 +180,7 @@ async def test_process_video_extracts_audio_and_uploads_mp3(
         return {"text": "hello world"}
 
     monkeypatch.setattr(tm_mod, "extract_audio", fake_extract)
-    monkeypatch.setattr(
-        manager, "_call_openai_transcription", fake_call
-    )
+    monkeypatch.setattr(manager, "_call_openai_transcription", fake_call)
 
     result = await manager.process_video(video, aweme_id="aw1")
 
@@ -214,9 +213,7 @@ async def test_process_video_audio_extract_failure_does_not_call_openai(
 
     open_mock = AsyncMock()
     monkeypatch.setattr(tm_mod, "extract_audio", failing_extract)
-    monkeypatch.setattr(
-        manager, "_call_openai_transcription", open_mock
-    )
+    monkeypatch.setattr(manager, "_call_openai_transcription", open_mock)
 
     result = await manager.process_video(video, aweme_id="aw_fail")
 
@@ -252,9 +249,7 @@ async def test_process_video_audio_extract_error_classes(
 
     monkeypatch.setattr(tm_mod, "extract_audio", failing_extract)
     open_mock = AsyncMock()
-    monkeypatch.setattr(
-        manager, "_call_openai_transcription", open_mock
-    )
+    monkeypatch.setattr(manager, "_call_openai_transcription", open_mock)
 
     result = await manager.process_video(video, aweme_id="aw_x")
     assert result["reason"] == "audio_extract_failed"
@@ -345,9 +340,7 @@ async def test_process_video_legacy_upload_when_flag_disabled(
     captured: Dict[str, Any] = {}
 
     async def fake_call(*, api_key, file_path, filename, content_type, model):
-        captured.update(
-            file_path=file_path, filename=filename, content_type=content_type
-        )
+        captured.update(file_path=file_path, filename=filename, content_type=content_type)
         return {"text": "ok"}
 
     monkeypatch.setattr(manager, "_call_openai_transcription", fake_call)
@@ -411,8 +404,7 @@ async def test_process_video_tempdir_cleanup_failure_only_warns(
     # error.
     assert result["status"] == "success"
     assert any(
-        "Failed to clean up transcript audio temp dir" in rec.message
-        for rec in caplog.records
+        "Failed to clean up transcript audio temp dir" in rec.message for rec in caplog.records
     )
 
 
@@ -458,6 +450,69 @@ async def test_process_video_does_not_log_api_key_plaintext(
 
     full_log = "\n".join(rec.getMessage() for rec in caplog.records)
     assert sentinel_key not in full_log
+
+
+async def test_call_openai_transcription_sets_connect_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """上传会话必须带 connect 细分超时：自定义 base_url/死代理指向黑洞端点
+    时，纯 total=600 会让每个视频在 worker 槽里最坏挂满 10 分钟（与批量
+    下载 PCDN 卡死同类）。总超时保留 600s，且不设读间隙限制——转写服务端
+    合法处理可达分钟级。"""
+    manager, _db, download_root = _build_manager(
+        tmp_path, api_key_env_value="sk-timeout-probe", monkeypatch=monkeypatch
+    )
+    video = _make_video(download_root)
+
+    async def passthrough_extract(video_path, out_dir, **kwargs):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        mp3 = out_dir / f"{video_path.stem}.mp3"
+        mp3.write_bytes(b"\x00")
+        return mp3
+
+    monkeypatch.setattr(tm_mod, "extract_audio", passthrough_extract)
+
+    captured: Dict[str, Any] = {}
+
+    class FakeResp:
+        status = 401
+
+        async def text(self):
+            return "denied"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakePostCtx:
+        async def __aenter__(self):
+            return FakeResp()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            captured.update(k)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def post(self, *a, **k):
+            return FakePostCtx()
+
+    monkeypatch.setattr("aiohttp.ClientSession", FakeSession)
+
+    await manager.process_video(video, aweme_id="aw_timeout_probe")
+
+    timeout = captured["timeout"]
+    assert timeout.total == 600
+    assert timeout.connect == 15
 
 
 async def test_call_openai_transcription_redacts_api_key_in_error_body(
@@ -521,9 +576,7 @@ async def test_call_openai_transcription_redacts_api_key_in_error_body(
     result = await manager.process_video(video, aweme_id="aw_redact")
     assert result["status"] == "failed"
     err_msg = result["error"]
-    assert sentinel not in err_msg, (
-        f"raw api_key leaked into error_message: {err_msg!r}"
-    )
+    assert sentinel not in err_msg, f"raw api_key leaked into error_message: {err_msg!r}"
     # Masked form should be present so the user can still tell which
     # key was used.
     assert "sk-L...CDEF" in err_msg

@@ -9,7 +9,9 @@ fastapi/uvicorn 是**可选**依赖。若未安装，导入本模块会 ImportEr
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException
@@ -18,7 +20,7 @@ from pydantic import BaseModel
 from auth import CookieManager
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
-from core import DouyinAPIClient, DownloaderFactory, URLParser
+from core import UNSUPPORTED_URL_TYPE_DETAIL, DouyinAPIClient, DownloaderFactory, URLParser
 from server.jobs import JobManager
 from storage import FileManager
 from utils.logger import setup_logger
@@ -82,7 +84,12 @@ async def _execute_download(url: str, deps: "_ServerDeps") -> Dict[str, int]:
     API client 仍按请求创建（aiohttp session 不跨请求复用）；其余重量级依赖从
     _ServerDeps 共享。
     """
-    async with DouyinAPIClient(deps.cookie_manager.get_cookies()) as api_client:
+    # proxy 与 cli.main.download_url 对齐:API 请求、短链解析和 CDN 媒体
+    # 下载(downloader_base 读 api_client.proxy)统一走配置代理。
+    async with DouyinAPIClient(
+        deps.cookie_manager.get_cookies(),
+        proxy=deps.config.get("proxy"),
+    ) as api_client:
         if is_short_url(url):
             resolved = await api_client.resolve_short_url(normalize_short_url(url))
             if not resolved:
@@ -92,6 +99,10 @@ async def _execute_download(url: str, deps: "_ServerDeps") -> Dict[str, int]:
         parsed = URLParser.parse(url)
         if not parsed:
             raise RuntimeError(f"Unsupported URL: {url}")
+        # 能力门禁：解析得出来但永远不会有下载器的类型，给出真实原因。
+        gated_detail = UNSUPPORTED_URL_TYPE_DETAIL.get(str(parsed.get("type") or ""))
+        if gated_detail:
+            raise RuntimeError(gated_detail)
 
         downloader = DownloaderFactory.create(
             parsed["type"],
@@ -117,6 +128,22 @@ async def _execute_download(url: str, deps: "_ServerDeps") -> Dict[str, int]:
         }
 
 
+def _start_live_recovery(config: ConfigLoader):
+    """服务模式下由服务自己恢复上次中断的直播分段；日志列表在开始服务前快照，新录制不受影响。"""
+    from core.live_finalize import recover_recordings
+    from storage.live_recordings import journal_root
+
+    try:
+        root = journal_root(None, config.get("path") or ".")
+        paths = sorted(Path(root).glob("*.json"))
+        if not paths:
+            return None
+        return asyncio.create_task(recover_recordings(root, database=None, paths=paths))
+    except Exception as exc:
+        logger.warning("Live recording recovery failed to start: %s", exc)
+        return None
+
+
 def build_app(config: ConfigLoader) -> FastAPI:
     deps = _ServerDeps(config)
 
@@ -137,7 +164,11 @@ def build_app(config: ConfigLoader) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        recovery = _start_live_recovery(config)
         yield
+        if recovery is not None and not recovery.done():
+            recovery.cancel()
+            await asyncio.gather(recovery, return_exceptions=True)
         await manager.shutdown()
 
     app = FastAPI(

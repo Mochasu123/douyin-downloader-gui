@@ -1,28 +1,55 @@
+import asyncio
 import json
 import re
+import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple
 from urllib.parse import urlparse
+
+import aiohttp
 
 from auth import CookieManager
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
+from core import item_reasons
 from core.api_client import DouyinAPIClient
+from core.comments_collector import CommentsCollector, needs_backfill, read_comments_state
 from core.live_photo import merge_live_photo_files
-from core.metadata import extract_author_sec_uid
+from core.metadata import (
+    build_author_home_url,
+    extract_author_sec_uid,
+    extract_video_cover_urls,
+)
+from core.output_naming import plan_output_paths
 from core.transcript_manager import TranscriptManager
 from storage import Database, FileManager, MetadataHandler
+from storage.database import order_cover_mirrors
+from utils.legacy_names import LegacyNameIndex
 from utils.logger import setup_logger
-from utils.naming import (
-    DEFAULT_FILE_TEMPLATE,
-    DEFAULT_FOLDER_TEMPLATE,
-    build_aweme_context,
-    render_template,
+from utils.naming import build_aweme_context
+from utils.paid_content import (
+    detect_mp4_encryption,
+    is_paid_content,
+    paid_content_warning,
 )
 
 logger = setup_logger("BaseDownloader")
+
+# 单条视频的兜底总时限。单次请求不设总时长（见 storage.file_manager），失败的
+# 尝试靠连接 / 读间隙上限和吞吐地板收敛，但 _download_video_with_fallback 会
+# 「候选数 × 重试轮数」地把这些等待叠起来（旧的单次 total=300s 时最坏能挂
+# 80 分钟），整个队列跟着停摆。15 分钟对正常大小的作品绰绰有余；这条时限也会
+# 截断一次耗时超过 15 分钟的普通视频下载（直播回放不走这里）。
+_VIDEO_ITEM_DEADLINE_S = 900
+
+# 评论接口连续这么多个作品请求失败就熔断，之后的作品先不请求评论：被限流时每个
+# 作品照旧耗满重试只会让限流持续（2026-11 用户日志里连着五个小时都在重试）。
+_COMMENTS_BREAKER_THRESHOLD = 3
+# 熔断后每隔这么久放一个作品去试探，成功就恢复；免得一次短暂断网让长任务余下的
+# 作品全都没有评论。
+_COMMENTS_BREAKER_COOLDOWN_S = 300.0
 
 
 class ProgressReporter(Protocol):
@@ -30,15 +57,18 @@ class ProgressReporter(Protocol):
 
     def set_item_total(self, total: int, detail: str = "") -> None: ...
 
-    def advance_item(self, status: str, detail: str = "") -> None: ...
+    # ``reason`` 只在跳过 / 失败时以关键字传入；成功路径仍是 (status, detail)。
+    def advance_item(self, status: str, detail: str = "", reason: str = "") -> None: ...
 
-    def on_file_progress(
-        self, file_name: str, written: int, expected_size: Optional[int]
-    ) -> None: ...
 
-    def should_pause(self) -> bool: ...
-
-    def should_cancel(self) -> bool: ...
+def _item_outcome(status: str) -> Optional[str]:
+    """结算状态 → 原因汇总的分组；成功返回 None。口径同 control.progress_reporter。"""
+    normalized = (status or "").strip().lower()
+    if normalized in ("ok", "success", "succeeded"):
+        return None
+    if normalized in ("skip", "skipped"):
+        return "skipped"
+    return "failed"
 
 
 class DownloadResult:
@@ -47,12 +77,20 @@ class DownloadResult:
         self.success = 0
         self.failed = 0
         self.skipped = 0
+        # 「列表没取全」的人话原因；只在有确凿证据（请求失败 / 受限空页）
+        # 时填写。四个计数字段表达不了这件事——分页被限流截断时 failed
+        # 恒为 0，任务会被 server/jobs.py 判成 SUCCESS。
+        self.incomplete_reason: Optional[str] = None
 
     def __str__(self):
         return f"Total: {self.total}, Success: {self.success}, Failed: {self.failed}, Skipped: {self.skipped}"
 
 
 class BaseDownloader(ABC):
+    # 浏览者自己的收藏 / 收藏合集：条目来自不同作者，目录归到浏览者名下
+    # （self/collect/），文件名里的作者取作品自己的（见 _naming_author）。
+    SELF_COLLECT_MODES = frozenset({"collect", "collectmix"})
+
     def __init__(
         self,
         config: ConfigLoader,
@@ -64,6 +102,7 @@ class BaseDownloader(ABC):
         retry_handler: Optional[RetryHandler] = None,
         queue_manager: Optional[QueueManager] = None,
         progress_reporter: Optional[ProgressReporter] = None,
+        job_id: Optional[str] = None,
     ):
         self.config = config
         self.api_client = api_client
@@ -75,9 +114,17 @@ class BaseDownloader(ABC):
         thread_count = int(self.config.get("thread", 5) or 5)
         self.queue_manager = queue_manager or QueueManager(max_workers=thread_count)
         self.progress_reporter = progress_reporter
+        # Server job that spawned this downloader (empty for CLI runs);
+        # written onto each aweme row for the History job cross-filter.
+        self.job_id = job_id
         self.metadata_handler = MetadataHandler()
         self.transcript_manager = TranscriptManager(self.config, self.file_manager, self.database)
         self._local_aweme_ids: Optional[set[str]] = None
+        # 与 _local_aweme_ids 同一次扫描建出：旧版截掉了作品 ID 的文件名。
+        self._legacy_names: Optional[LegacyNameIndex] = None
+        # 延迟到事件循环内创建（3.9 上 asyncio.Lock() 在无运行循环时创建
+        # 会绑定错误的 loop）。
+        self._local_index_build_lock: Optional[asyncio.Lock] = None
         self._aweme_id_pattern = re.compile(r"(?<!\d)(\d{15,20})(?!\d)")
         self._local_media_suffixes = {
             ".mp4",
@@ -92,6 +139,22 @@ class BaseDownloader(ABC):
         # 控制终端错误日志量，避免进度条被大量日志打断后出现重复重绘。
         self._download_error_log_count = 0
         self._download_error_log_limit = 5
+        # 本次任务已解析过的作者目录，键是 (昵称, sec_uid, 目录风格)。
+        # 只为「打开输出文件夹」上报一次，避免每条作品都多敲一次 mkdir。
+        self._author_dir_cache: Dict[Tuple[str, str, str], Path] = {}
+        # 条目跳过 / 失败原因，见 `_note_item_reason`。键是 aweme_id：同一实例上
+        # 的条目在单个事件循环里并发（queue_manager.download_batch），标量会在
+        # await 之间被别的条目覆盖。
+        self._item_reasons: Dict[str, str] = {}
+        # {"failed"|"skipped": {原因: 次数}}，插入顺序即首次出现顺序。
+        self._item_reason_counts: Dict[str, Dict[str, int]] = {}
+        # 评论没存全的作品（请求失败或熔断跳过）。作品本身照算成功，缺口由
+        # comments_incomplete_note() 在任务结束时说明。
+        self._comments_incomplete_ids: Set[str] = set()
+        self._comments_failure_streak = 0
+        # 熔断中为 time.monotonic() 的截止时刻，否则为 None。
+        self._comments_breaker_until: Optional[float] = None
+        self._comments_breaker_tripped = False
 
     def _progress_update_step(self, step: str, detail: str = "") -> None:
         if not self.progress_reporter:
@@ -109,45 +172,156 @@ class BaseDownloader(ABC):
         except Exception as exc:
             logger.debug("Progress set_item_total failed: %s", exc)
 
-    def _progress_advance_item(self, status: str, detail: str = "") -> None:
+    def _progress_advance_item(self, status: str, detail: str = "", reason: str = "") -> None:
+        """结算一个条目：发 item-complete，并为跳过 / 失败计入原因汇总。
+
+        ``detail`` 是条目 id。``reason`` 是调用点给的笼统原因；内层出口用
+        `_note_item_reason` 记下的原因更具体，优先使用。两者都没有时退回
+        「未记录具体原因」，保证每条跳过 / 失败行都有原因。
+        """
+        reason = self._settle_item_reason(status, detail, reason)
         if not self.progress_reporter:
             return
         try:
-            self.progress_reporter.advance_item(status, detail)
+            if reason:
+                self.progress_reporter.advance_item(status, detail, reason=reason)
+            else:
+                self.progress_reporter.advance_item(status, detail)
         except Exception as exc:
             logger.debug("Progress advance_item failed: %s", exc)
 
-    def _progress_file_progress(
-        self, file_name: str, written: int, expected_size: Optional[int]
+    def _note_item_reason(self, aweme_id: Any, reason: str, *, replace: bool = False) -> bool:
+        """在跳过 / 失败出口记下原因，返回 False 方便写成 ``return self._note_item_reason(...)``。
+
+        默认先记先得：内层（如单条时限超时）先写，外层笼统原因（线路全失败）
+        不覆盖。确实更具体的后续判断用 ``replace=True``。
+        """
+        key = str(aweme_id or "")
+        if key and (replace or key not in self._item_reasons):
+            self._item_reasons[key] = reason
+        return False
+
+    def pop_item_reason(self, aweme_id: Any, status: str = "failed") -> str:
+        """取出并清掉条目记下的原因；与结算状态不同类（或是成功）时返回空串。"""
+        recorded = self._item_reasons.pop(str(aweme_id or ""), "")
+        outcome = _item_outcome(status)
+        if not recorded or outcome is None:
+            return ""
+        if (recorded in item_reasons.SKIP_REASONS) != (outcome == "skipped"):
+            return ""
+        return recorded
+
+    def _settle_item_reason(self, status: str, aweme_id: Any, fallback: str) -> str:
+        recorded = self.pop_item_reason(aweme_id, status)
+        outcome = _item_outcome(status)
+        if outcome is None:
+            return ""
+        reason = recorded or fallback
+        if not reason:
+            reason = (
+                item_reasons.SKIP_UNSPECIFIED
+                if outcome == "skipped"
+                else item_reasons.FAIL_UNSPECIFIED
+            )
+        counts = self._item_reason_counts.setdefault(outcome, {})
+        counts[reason] = counts.get(reason, 0) + 1
+        return reason
+
+    def _settle_crashed_item(self, item: Dict[str, Any], entry: Any) -> None:
+        """为 download_batch 里抛异常、没来得及结算的条目补发 item-complete。
+
+        异常才是真正的失败原因，覆盖此前记下的跳过原因（如判定「已有该作品」
+        后补抓评论抛错）。
+        """
+        aweme_id = str(item.get("aweme_id") or "unknown")
+        reason = (
+            item_reasons.reason_for_exception(entry)
+            if isinstance(entry, BaseException)
+            else item_reasons.FAIL_UNEXPECTED
+        )
+        self._note_item_reason(aweme_id, reason, replace=True)
+        self._progress_advance_item("failed", aweme_id)
+
+    def item_reason_summary(self) -> Dict[str, List[Dict[str, Any]]]:
+        """本实例已结算条目的原因汇总，按次数降序；没有跳过 / 失败时为空 dict。"""
+        summary: Dict[str, List[Dict[str, Any]]] = {}
+        for outcome in ("failed", "skipped"):
+            counts = self._item_reason_counts.get(outcome)
+            if not counts:
+                continue
+            ranked = sorted(counts.items(), key=lambda pair: -pair[1])
+            summary[outcome] = [{"reason": text, "count": count} for text, count in ranked]
+        return summary
+
+    def comments_incomplete_note(self) -> Optional[str]:
+        """评论没存全的作品数，给任务卡片「这次没有取全」用；都存全了返回 None。"""
+        count = len(self._comments_incomplete_ids)
+        if not count:
+            return None
+        note = "{0} 个作品的评论没取全（评论接口请求失败，可能被抖音限流或登录失效）".format(count)
+        if self._comments_breaker_tripped:
+            note += "，连续失败期间部分作品没有请求评论"
+        return note + (
+            "。作品文件不受影响；稍后重新提交同一链接即可补抓缺的评论"
+            "（保持「增量下载」开启，已下载的作品不会重下）"
+        )
+
+    def _make_item_progress(self, aweme_id: Optional[str]):
+        """构造单文件下载途中的字节进度回调（没有 reporter / id 时返回 None）。
+
+        批量任务原先只在整条作品的全部资产下完后才 advance_item，单个大
+        文件或慢节点期间事件流完全静止——线上 job f25a60b4850f 队尾一条
+        视频静默 5 分钟，用户判定为卡死并连续取消了 4 个任务。
+        """
+        reporter = self.progress_reporter
+        if not reporter or not aweme_id:
+            return None
+        emit = getattr(reporter, "on_item_progress", None)
+        if not callable(emit):
+            return None
+
+        def _on_progress(bytes_read: int, bytes_total: int) -> None:
+            try:
+                emit(aweme_id=aweme_id, bytes_read=bytes_read, bytes_total=bytes_total)
+            except Exception as exc:
+                logger.debug("Progress on_item_progress failed: %s", exc)
+
+        return _on_progress
+
+    def _report_author_output_dir(
+        self,
+        author_name: str,
+        author_sec_uid: Optional[str],
+        author_dir_style: str,
     ) -> None:
+        """把作品实际落盘的作者目录报给宿主任务。
+
+        任务卡片的「打开输出文件夹」要落在当前博主目录，而不是设置里的下载
+        根目录。跨作者任务（收藏夹）与去重由 reporter 侧聚合处理，见
+        ``QueueProgressReporter.on_output_dir``；这里只负责在每个作者第一次
+        出现时把目录算出来上报一次。
+        """
         if not self.progress_reporter:
             return
+        key = (author_name, author_sec_uid or "", author_dir_style)
+        if key in self._author_dir_cache:
+            return
         try:
-            fn = getattr(self.progress_reporter, "on_file_progress", None)
+            author_dir = self.file_manager.get_author_dir(
+                author_name,
+                author_sec_uid=author_sec_uid,
+                author_dir_style=author_dir_style,
+            )
+        except Exception as exc:
+            logger.debug("Resolve author dir for progress failed: %s", exc)
+            return
+        self._author_dir_cache[key] = author_dir
+        try:
+            fn = getattr(self.progress_reporter, "on_output_dir", None)
             if callable(fn):
-                fn(file_name, written, expected_size)
+                fn(path=str(author_dir))
         except Exception as exc:
-            logger.debug("Progress on_file_progress failed: %s", exc)
-
-    def _progress_should_pause(self) -> bool:
-        if not self.progress_reporter:
-            return False
-        try:
-            fn = getattr(self.progress_reporter, "should_pause", None)
-            return bool(fn()) if callable(fn) else False
-        except Exception as exc:
-            logger.debug("Progress should_pause failed: %s", exc)
-            return False
-
-    def _progress_should_cancel(self) -> bool:
-        if not self.progress_reporter:
-            return False
-        try:
-            fn = getattr(self.progress_reporter, "should_cancel", None)
-            return bool(fn()) if callable(fn) else False
-        except Exception as exc:
-            logger.debug("Progress should_cancel failed: %s", exc)
-            return False
+            logger.debug("Progress on_output_dir failed: %s", exc)
 
     def _progress_report_author(
         self,
@@ -191,27 +365,66 @@ class BaseDownloader(ABC):
     async def download(self, parsed_url: Dict[str, Any]) -> DownloadResult:
         pass
 
-    async def _should_download(self, aweme_id: str) -> bool:
-        in_local = self._is_locally_downloaded(aweme_id)
-        in_db = False
-        if self.database:
-            in_db = await self.database.is_downloaded(aweme_id)
-
-        if in_db and in_local:
-            return False
-
-        if in_db and not in_local:
-            logger.info(
-                "Aweme %s exists in database but media file not found locally, retry download",
-                aweme_id,
-            )
+    async def _should_download(
+        self,
+        aweme_id: str,
+        *,
+        force: bool = False,
+        aweme: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """``aweme`` 是条目本身；传了才能认出旧版截掉作品 ID 的文件名。"""
+        if force:
             return True
 
-        if in_local:
+        await self._ensure_local_aweme_index()
+        if self._is_locally_downloaded(aweme_id) or self._matches_legacy_name(aweme):
             logger.info("Aweme %s already exists locally, skipping", aweme_id)
-            return False
+            return self._note_item_reason(aweme_id, item_reasons.SKIP_LOCAL_FILE_EXISTS)
+
+        if self._redownload_missing_files_enabled() or self.database is None:
+            return True
+
+        try:
+            if await self.database.is_downloaded(aweme_id):
+                logger.info(
+                    "Aweme %s exists in download history; skipping missing local file",
+                    aweme_id,
+                )
+                return self._note_item_reason(aweme_id, item_reasons.SKIP_HISTORY_EXISTS)
+        except Exception as exc:
+            # 历史库只是增量判定的可选兜底；状态不明时宁可补下，不能把作品
+            # 永久误判为已下载。
+            logger.warning(
+                "Download history lookup failed for aweme %s, downloading it: %s",
+                aweme_id,
+                exc,
+            )
 
         return True
+
+    def _redownload_missing_files_enabled(self) -> bool:
+        value = self.config.get("redownload_missing_files", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    async def _ensure_local_aweme_index(self) -> None:
+        """在工作线程中完成首次全库扫描建索引。
+
+        扫描是同步 rglob + stat 重活；直接跑在事件循环里会把整个 HTTP
+        服务冻住（大库/慢盘可达分钟级），桌面端看门狗会在连续两次
+        /health 失联后强杀后台服务、丢掉运行中的 job。加锁避免并发
+        worker 对同一根目录重复扫描。
+        """
+        if self._local_aweme_ids is not None:
+            return
+        lock = self._local_index_build_lock
+        if lock is None:
+            lock = self._local_index_build_lock = asyncio.Lock()
+        async with lock:
+            if self._local_aweme_ids is not None:
+                return
+            await asyncio.to_thread(self._build_local_aweme_index)
 
     def _is_locally_downloaded(self, aweme_id: str) -> bool:
         if not aweme_id:
@@ -224,15 +437,31 @@ class BaseDownloader(ABC):
             return False
         return aweme_id in self._local_aweme_ids
 
+    def _matches_legacy_name(self, aweme: Optional[Dict[str, Any]]) -> bool:
+        """旧版截断掉作品 ID 的文件名，按发布日期 + 标题对回作品（见 utils.legacy_names）。"""
+        if not aweme or self._legacy_names is None:
+            return False
+        _, publish_date = self._resolve_publish_time(aweme.get("create_time"))
+        # 与 _aweme_file_metadata 取标题的口径一致。
+        title = (aweme.get("desc") or "").strip() or "no_title"
+        return self._legacy_names.matches(publish_date, title, str(aweme.get("aweme_id") or ""))
+
     def _build_local_aweme_index(self):
         base_path = self.file_manager.base_path
         aweme_ids: set[str] = set()
+        legacy_names = LegacyNameIndex()
 
         if base_path.exists():
             for path in base_path.rglob("*"):
                 if not path.is_file():
                     continue
                 if path.suffix.lower() not in self._local_media_suffixes:
+                    continue
+                # Optional sidecars include the aweme id in their filename but
+                # do not mean the primary video/gallery asset exists. Ignoring
+                # them lets a later run with ``video: true`` fetch the actual
+                # video after an earlier cover-only archive.
+                if path.stem.lower().endswith(("_cover", "_avatar", "_music")):
                     continue
                 try:
                     if path.stat().st_size <= 0:
@@ -241,7 +470,10 @@ class BaseDownloader(ABC):
                     continue
                 for match in self._aweme_id_pattern.finditer(path.name):
                     aweme_ids.add(match.group(1))
+                legacy_names.add(path.stem)
 
+        # 先放旧版名索引：_local_aweme_ids 非 None 即视为索引已建好。
+        self._legacy_names = legacy_names
         self._local_aweme_ids = aweme_ids
 
     def _mark_local_aweme_downloaded(self, aweme_id: str):
@@ -249,27 +481,46 @@ class BaseDownloader(ABC):
             return
 
         if self._local_aweme_ids is None:
+            # retry_executor 直接调用 _download_aweme_assets（不经过
+            # _should_download），此时索引还未建；先建立本任务的索引，
+            # 再把刚下载的作品加入其中。
+            self._build_local_aweme_index()
+        if self._local_aweme_ids is None:  # pragma: no cover — 防御
             self._local_aweme_ids = set()
         self._local_aweme_ids.add(aweme_id)
 
-    def _filter_by_time(self, aweme_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _time_range_bounds(self) -> Tuple[Optional[int], Optional[int]]:
         start_time = self.config.get("start_time")
         end_time = self.config.get("end_time")
-
-        if not start_time and not end_time:
-            return aweme_list
-
         start_ts = (
             int(datetime.strptime(start_time, "%Y-%m-%d").timestamp()) if start_time else None
         )
-        end_ts = int(datetime.strptime(end_time, "%Y-%m-%d").timestamp()) if end_time else None
+        end_ts = None
+        if end_time:
+            end_date = datetime.strptime(end_time, "%Y-%m-%d") + timedelta(days=1)
+            end_ts = int(end_date.timestamp())
+        # per-job 增量窗口(订阅自动下载注入;语义:min 排除等于、max 保留等于,
+        # 与 _filter_by_time 的「start 保留等于 / end 排除等于」拼合后正好是
+        # (watermark, window_top] 区间)。0/缺失 = 不启用。
+        min_ct = int(self.config.get("min_create_time", 0) or 0)
+        if min_ct > 0:
+            start_ts = max(start_ts or 0, min_ct + 1)
+        max_ct = int(self.config.get("max_create_time", 0) or 0)
+        if max_ct > 0:
+            end_ts = min(end_ts, max_ct + 1) if end_ts else max_ct + 1
+        return start_ts, end_ts
+
+    def _filter_by_time(self, aweme_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        start_ts, end_ts = self._time_range_bounds()
+        if start_ts is None and end_ts is None:
+            return aweme_list
 
         filtered: List[Dict[str, Any]] = []
         for aweme in aweme_list:
             create_time = aweme.get("create_time", 0)
             if start_ts is not None and create_time < start_ts:
                 continue
-            if end_ts is not None and create_time > end_ts:
+            if end_ts is not None and create_time >= end_ts:
                 continue
             filtered.append(aweme)
 
@@ -283,19 +534,17 @@ class BaseDownloader(ABC):
             return aweme_list[:limit]
         return aweme_list
 
-    async def _download_aweme_assets(
-        self,
-        aweme_data: Dict[str, Any],
-        author_name: str,
-        mode: Optional[str] = None,
-        *,
-        db_batch: Optional[List[Dict[str, Any]]] = None,
-        collection_dir: Optional[str] = None,
-    ) -> bool:
+    def _comments_config(self) -> Optional[Dict[str, Any]]:
+        comments_cfg = self.config.get("comments") or {}
+        if isinstance(comments_cfg, dict) and comments_cfg.get("enabled"):
+            return comments_cfg
+        return None
+
+    def _aweme_file_metadata(self, aweme_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         aweme_id = aweme_data.get("aweme_id")
         if not aweme_id:
             logger.error("Missing aweme_id in aweme data")
-            return False
+            return None
 
         desc = (aweme_data.get("desc", "no_title") or "").strip() or "no_title"
         publish_ts, publish_date = self._resolve_publish_time(aweme_data.get("create_time"))
@@ -306,102 +555,326 @@ class BaseDownloader(ABC):
                 aweme_id,
                 publish_date,
             )
-        media_type = self._detect_media_type(aweme_data)
-        template_context = build_aweme_context(
-            aweme_id=str(aweme_id),
-            title=desc,
+        return {
+            "aweme_id": aweme_id,
+            "desc": desc,
+            "publish_ts": publish_ts,
+            "publish_date": publish_date,
+            "media_type": self._detect_media_type(aweme_data),
+        }
+
+    def _aweme_naming_context(
+        self,
+        aweme_data: Dict[str, Any],
+        metadata: Dict[str, Any],
+        *,
+        author_name: str,
+        mode: Optional[str],
+        author_sec_uid: Optional[str] = None,
+    ) -> Dict[str, str]:
+        return build_aweme_context(
+            aweme_id=str(metadata["aweme_id"]),
+            title=str(metadata["desc"]),
             author_name=author_name,
-            author_sec_uid=extract_author_sec_uid(aweme_data),
-            publish_date=publish_date,
-            publish_ts=publish_ts,
-            media_type=media_type,
+            author_sec_uid=author_sec_uid or extract_author_sec_uid(aweme_data),
+            publish_date=str(metadata["publish_date"]),
+            publish_ts=metadata["publish_ts"],
+            media_type=str(metadata["media_type"]),
             mode=mode,
-        )
-        filename_template = self.config.get("filename_template") or DEFAULT_FILE_TEMPLATE
-        folder_template = self.config.get("folder_template") or DEFAULT_FOLDER_TEMPLATE
-        file_stem = render_template(
-            filename_template,
-            template_context,
-            fallback=f"{publish_date}_{aweme_id}",
-        )
-        folder_name = render_template(
-            folder_template,
-            template_context,
-            fallback=f"{publish_date}_{aweme_id}",
         )
 
-        save_dir = self.file_manager.get_save_path(
-            author_name=author_name,
+    def _build_aweme_file_context(
+        self,
+        aweme_data: Dict[str, Any],
+        author_name: str,
+        mode: Optional[str] = None,
+        *,
+        author_sec_uid: Optional[str] = None,
+        collection_dir: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        metadata = self._aweme_file_metadata(aweme_data)
+        if metadata is None:
+            return None
+
+        effective_sec_uid = author_sec_uid or extract_author_sec_uid(aweme_data)
+        naming_author, naming_sec_uid = self._naming_author(
+            aweme_data, mode, author_name=author_name, author_sec_uid=effective_sec_uid
+        )
+        context = self._aweme_naming_context(
+            aweme_data,
+            metadata,
+            author_name=naming_author,
             mode=mode,
-            aweme_title=desc,
-            aweme_id=aweme_id,
-            folderstyle=self.config.get("folderstyle", True),
-            download_date=publish_date,
-            folder_name=folder_name,
-            author_sec_uid=extract_author_sec_uid(aweme_data),
-            author_dir_style=self.config.get("author_dir") or "nickname",
-            group_by_mode=self.config.get("group_by_mode", True),
+            author_sec_uid=naming_sec_uid,
+        )
+        author_dir_style = self.config.get("author_dir") or "nickname"
+        self._report_author_output_dir(author_name, effective_sec_uid, author_dir_style)
+        save_dir, file_stem = plan_output_paths(
+            file_manager=self.file_manager,
+            config=self.config,
+            context=context,
+            mode=mode,
+            author_name=author_name,
+            author_sec_uid=effective_sec_uid,
+            collection_dir=collection_dir,
+            with_transcript=metadata["media_type"] == "video" and self.config.get("video", True),
+            suffixes=self._aweme_output_suffixes(aweme_data),
+        )
+        return {**metadata, "file_stem": file_stem, "save_dir": save_dir}
+
+    def _naming_author(
+        self,
+        aweme_data: Dict[str, Any],
+        mode: Optional[str],
+        *,
+        author_name: str,
+        author_sec_uid: Optional[str],
+    ) -> Tuple[str, Optional[str]]:
+        """文件名模板里 {author} / {author_id} 用的作者。
+
+        自己的收藏里目录作者是占位的 self（或浏览者本人），按它填会让每个作品
+        的作者都变成 self（#253），这里改取作品自己的作者，取不到再回退。
+        """
+        if mode not in self.SELF_COLLECT_MODES:
+            return author_name, author_sec_uid
+        author = aweme_data.get("author")
+        nickname = str(author.get("nickname") or "").strip() if isinstance(author, dict) else ""
+        return nickname or author_name, extract_author_sec_uid(aweme_data) or author_sec_uid
+
+    def _aweme_output_suffixes(self, aweme_data: Dict[str, Any]) -> Tuple[str, ...]:
+        suffixes = [".mp4.tmp", ".transcript.json", "_comments.json", "_avatar.webp.tmp"]
+        image_count = len(self._collect_image_url_candidates(aweme_data))
+        suffixes.append("_{0}.webp.tmp".format(image_count))
+        for index, url in self._collect_image_live_urls(aweme_data):
+            extension = Path(urlparse(url).path).suffix or ".mp4"
+            suffixes.append("_live_{0}{1}.tmp".format(index, extension))
+        return tuple(suffixes)
+
+    async def _save_comments(
+        self,
+        aweme_id: str,
+        comments_path: Path,
+        comments_cfg: Dict[str, Any],
+    ) -> bool:
+        """抓评论并写盘，返回盘上的评论文件是否完整；没存全的作品记进
+        ``_comments_incomplete_ids``。"""
+        aweme_id = str(aweme_id)
+        if self._comments_breaker_blocks():
+            if not needs_backfill(await read_comments_state(comments_path)):
+                return True
+            self._comments_incomplete_ids.add(aweme_id)
+            return False
+
+        collector = CommentsCollector(
+            self.api_client,
+            self.metadata_handler,
+            include_replies=bool(comments_cfg.get("include_replies", False)),
+            max_comments=int(comments_cfg.get("max_comments", 0) or 0),
+            page_size=int(comments_cfg.get("page_size", 20) or 20),
+            rate_limiter=self.rate_limiter,
+        )
+        outcome = await collector.collect_and_save(aweme_id, comments_path)
+        self._record_comments_fetch(outcome.fetched)
+        if outcome.complete:
+            self._comments_incomplete_ids.discard(aweme_id)
+        else:
+            self._comments_incomplete_ids.add(aweme_id)
+
+        if outcome.fetched and comments_cfg.get("download_media") and comments_path.exists():
+            try:
+                from core.comment_media import CommentMediaDownloader, collect_all_comment_images
+
+                payload = json.loads(comments_path.read_text(encoding="utf-8"))
+                comments = payload.get("comments") if isinstance(payload, dict) else []
+                images = collect_all_comment_images(comments if isinstance(comments, list) else [])
+                if images:
+                    media_dir = comments_path.with_name(f"{comments_path.stem}_media")
+                    media_dl = CommentMediaDownloader(
+                        file_manager=self.file_manager,
+                        api_client=self.api_client,
+                    )
+                    await media_dl.download_comment_images(images, media_dir)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to download comment media for %s: %s", aweme_id, exc)
+
+        return bool(outcome.complete)
+
+    def _comments_breaker_blocks(self) -> bool:
+        """熔断中返回 True。冷却期满时放行这一个作品去试探，同时把截止时刻后推，
+        并发的其它作品继续等它的结果。"""
+        if self._comments_breaker_until is None:
+            return False
+        now = time.monotonic()
+        if now < self._comments_breaker_until:
+            return True
+        self._comments_breaker_until = now + _COMMENTS_BREAKER_COOLDOWN_S
+        return False
+
+    def _record_comments_fetch(self, fetched: bool) -> None:
+        if fetched:
+            self._comments_failure_streak = 0
+            self._comments_breaker_until = None
+            return
+        self._comments_failure_streak += 1
+        if self._comments_failure_streak < _COMMENTS_BREAKER_THRESHOLD:
+            return
+        if self._comments_breaker_until is None:
+            logger.warning(
+                "Comments API failed for %d works in a row; pausing comment requests for %ds",
+                self._comments_failure_streak,
+                int(_COMMENTS_BREAKER_COOLDOWN_S),
+            )
+        self._comments_breaker_until = time.monotonic() + _COMMENTS_BREAKER_COOLDOWN_S
+        self._comments_breaker_tripped = True
+
+    async def _collect_comments_for_existing_aweme(
+        self,
+        aweme_data: Dict[str, Any],
+        author_name: str,
+        mode: Optional[str] = None,
+        *,
+        author_sec_uid: Optional[str] = None,
+        collection_dir: Optional[str] = None,
+    ) -> bool:
+        comments_cfg = self._comments_config()
+        if comments_cfg is None:
+            return False
+
+        file_context = self._build_aweme_file_context(
+            aweme_data,
+            author_name,
+            mode,
+            author_sec_uid=author_sec_uid,
             collection_dir=collection_dir,
         )
+        if file_context is None:
+            return False
+
+        aweme_id = file_context["aweme_id"]
+        comments_path = file_context["save_dir"] / f"{file_context['file_stem']}_comments.json"
+        # 旧版本请求失败时也会写下 0 条的空文件；它和标了 complete=false 的部分结果
+        # 都要重新请求，见 comments_collector.needs_backfill。
+        if not needs_backfill(await read_comments_state(comments_path)):
+            return self._note_item_reason(aweme_id, item_reasons.SKIP_COMMENTS_EXIST, replace=True)
+
+        if await self._save_comments(str(aweme_id), comments_path, comments_cfg):
+            return True
+        return self._note_item_reason(aweme_id, item_reasons.SKIP_COMMENTS_FAILED, replace=True)
+
+    async def _download_aweme_assets(
+        self,
+        aweme_data: Dict[str, Any],
+        author_name: str,
+        mode: Optional[str] = None,
+        *,
+        db_batch: Optional[List[Dict[str, Any]]] = None,
+        author_sec_uid: Optional[str] = None,
+        collection_dir: Optional[str] = None,
+    ) -> bool:
+        # retry_executor 直接调本方法（不经过 _should_download），先在
+        # 线程里把索引建好，避免成功后的 _mark_local_aweme_downloaded
+        # 在事件循环里触发同步全库扫描。
+        await self._ensure_local_aweme_index()
+        file_context = self._build_aweme_file_context(
+            aweme_data,
+            author_name,
+            mode,
+            author_sec_uid=author_sec_uid,
+            collection_dir=collection_dir,
+        )
+        if file_context is None:
+            return False
+
+        aweme_id = file_context["aweme_id"]
+        desc = file_context["desc"]
+        publish_ts = file_context["publish_ts"]
+        publish_date = file_context["publish_date"]
+        media_type = file_context["media_type"]
+        file_stem = file_context["file_stem"]
+        save_dir = file_context["save_dir"]
         downloaded_files: List[Path] = []
 
         session = await self.api_client.get_session()
         video_path: Optional[Path] = None
+        primary_media_downloaded = False
+        # 可选资产（封面/音乐/头像）相互独立且不影响主媒体成败：统一登记
+        # (保存路径, 未 await 的协程) 后并行下载，避免串行等待每个附件
+        # （尤其是慢镜像）时占住全局下载并发槽。视频关闭时这些附件仍可
+        # 独立保存，因此封面归档不再强制要求先下载 mp4。
+        optional_assets: List[Tuple[Path, Any]] = []
 
         if media_type == "video":
-            video_candidates = self._build_video_url_candidates(aweme_data)
-            if not video_candidates:
-                logger.error("No playable video URL found for aweme %s", aweme_id)
-                return False
+            paid_note = paid_content_warning(aweme_data)
+            if paid_note:
+                logger.warning("Aweme %s: %s", aweme_id, paid_note)
+            if self.config.get("video", True):
+                video_candidates = self._build_video_url_candidates(aweme_data)
+                if not video_candidates:
+                    logger.error("No playable video URL found for aweme %s", aweme_id)
+                    return self._note_item_reason(
+                        aweme_id,
+                        item_reasons.FAIL_PAID_NO_VIDEO_URL
+                        if paid_note
+                        else item_reasons.FAIL_NO_VIDEO_URL,
+                    )
+                video_candidates = await self._maybe_promote_original_candidate(
+                    aweme_data, video_candidates, session
+                )
 
-            video_path = save_dir / f"{file_stem}.mp4"
-            if not await self._download_video_with_fallback(video_candidates, video_path, session):
-                return False
-            downloaded_files.append(video_path)
+                video_path = save_dir / f"{file_stem}.mp4"
+                if not await self._download_video_with_fallback(
+                    video_candidates, video_path, session, aweme_id=aweme_id
+                ):
+                    return self._note_item_reason(aweme_id, item_reasons.FAIL_VIDEO_ALL_SOURCES)
+                if not self._discard_if_encrypted(video_path, aweme_id):
+                    return self._note_item_reason(aweme_id, item_reasons.FAIL_ENCRYPTED)
+                downloaded_files.append(video_path)
+                primary_media_downloaded = True
 
             if self.config.get("cover"):
-                cover_source = aweme_data.get("video", {}).get("cover")
-                if self._extract_urls(cover_source):
+                cover_urls = extract_video_cover_urls(aweme_data)
+                if cover_urls:
                     cover_path = save_dir / f"{file_stem}_cover.jpg"
-                    if await self._download_first_available(
-                        cover_source,
-                        cover_path,
-                        session,
-                        headers=self._download_headers(),
-                        optional=True,
-                    ):
-                        downloaded_files.append(cover_path)
+                    optional_assets.append(
+                        (
+                            cover_path,
+                            self._download_first_available(
+                                cover_urls,
+                                cover_path,
+                                session,
+                                headers=self._download_headers(),
+                                optional=True,
+                            ),
+                        )
+                    )
 
             if self.config.get("music"):
                 music_url = self._extract_first_url(aweme_data.get("music", {}).get("play_url"))
                 if music_url:
                     music_path = save_dir / f"{file_stem}_music.mp3"
-                    if await self._download_with_retry(
-                        music_url,
-                        music_path,
-                        session,
-                        headers=self._download_headers(),
-                        optional=True,
-                    ):
-                        downloaded_files.append(music_path)
+                    optional_assets.append(
+                        (
+                            music_path,
+                            self._download_with_retry(
+                                music_url,
+                                music_path,
+                                session,
+                                headers=self._download_headers(),
+                                optional=True,
+                            ),
+                        )
+                    )
 
         elif media_type == "gallery":
-            gallery_assets = self._collect_gallery_assets(aweme_data)
-            image_url_candidates = [
-                candidates for _, candidates, _ in gallery_assets if candidates
-            ]
-            image_live_pairs = [
-                (gallery_index, live_url)
-                for gallery_index, _, live_url in gallery_assets
-                if live_url
-            ]
+            image_url_candidates = self._collect_image_url_candidates(aweme_data)
+            image_live_urls = self._collect_image_live_urls(aweme_data)
             logger.info(
                 "Gallery aweme %s: %d image(s), %d live photo(s)",
                 aweme_id,
                 len(image_url_candidates),
-                len(image_live_pairs),
+                len(image_live_urls),
             )
-            if not image_url_candidates and not image_live_pairs:
+            if not image_url_candidates and not image_live_urls:
                 logger.error(
                     "No gallery assets found for aweme %s (aweme_type=%s, "
                     "has image_post_info=%s, has images=%s)",
@@ -410,9 +883,9 @@ class BaseDownloader(ABC):
                     "image_post_info" in aweme_data,
                     "images" in aweme_data,
                 )
-                return False
+                return self._note_item_reason(aweme_id, item_reasons.FAIL_GALLERY_NO_ASSETS)
 
-            downloaded_image_paths: List[Path] = []
+            downloaded_image_by_index: Dict[int, Path] = {}
             for index, candidates in enumerate(image_url_candidates, start=1):
                 download_result: bool | Path = False
                 # 与 _download_first_available 同原则：多镜像时镜像列表本身
@@ -434,20 +907,18 @@ class BaseDownloader(ABC):
                         retry=use_backoff,
                     )
                     if download_result:
-                        saved_image_path = (
+                        saved_img = (
                             download_result if isinstance(download_result, Path) else image_path
                         )
-                        downloaded_files.append(saved_image_path)
-                        downloaded_image_paths.append(saved_image_path)
+                        downloaded_files.append(saved_img)
+                        downloaded_image_by_index[index] = saved_img
                         break
                 if not download_result:
                     logger.error(f"Failed downloading image {index} for aweme {aweme_id}")
-                    return False
+                    return self._note_item_reason(aweme_id, item_reasons.FAIL_GALLERY_IMAGE)
 
-            downloaded_live_paths: List[Path] = []
-            for index, (_gallery_index, live_url) in enumerate(
-                image_live_pairs, start=1
-            ):
+            downloaded_live_by_index: List[Tuple[int, Path]] = []
+            for index, live_url in image_live_urls:
                 suffix = Path(urlparse(live_url).path).suffix or ".mp4"
                 live_path = save_dir / f"{file_stem}_live_{index}{suffix}"
                 success = await self._download_with_retry(
@@ -458,72 +929,84 @@ class BaseDownloader(ABC):
                 )
                 if not success:
                     logger.error(f"Failed downloading live image {index} for aweme {aweme_id}")
-                    return False
+                    return self._note_item_reason(aweme_id, item_reasons.FAIL_LIVE_PHOTO)
                 downloaded_files.append(live_path)
-                downloaded_live_paths.append(live_path)
+                downloaded_live_by_index.append((index, live_path))
 
-            # 动图合并：静态图 + 动图视频 → 华为手机可直接查看的动态照片
             if self.config.get("live_photo_merge", True):
-                image_pos_by_gallery: Dict[int, int] = {}
-                for position, (gallery_index, candidates, _live_url) in enumerate(
-                    gallery_assets, start=1
-                ):
-                    if candidates:
-                        image_pos_by_gallery[gallery_index] = position
-                for index, (gallery_index, _live_url) in enumerate(
-                    image_live_pairs, start=1
-                ):
-                    image_position = image_pos_by_gallery.get(gallery_index)
-                    if image_position is None or image_position > len(
-                        downloaded_image_paths
-                    ):
+                for index, live_path in downloaded_live_by_index:
+                    still_path = downloaded_image_by_index.get(index)
+                    if still_path is None:
                         continue
-                    still_path = downloaded_image_paths[image_position - 1]
-                    video_path = downloaded_live_paths[index - 1]
                     merged_path = save_dir / f"{file_stem}_live_{index}.jpg"
-                    if merge_live_photo_files(still_path, video_path, merged_path):
+                    if merge_live_photo_files(still_path, live_path, merged_path):
                         downloaded_files.append(merged_path)
+            primary_media_downloaded = True
         else:
             logger.error("Unsupported media type for aweme %s: %s", aweme_id, media_type)
-            return False
+            return self._note_item_reason(aweme_id, item_reasons.FAIL_UNSUPPORTED_MEDIA)
 
         if self.config.get("avatar"):
-            avatar_source = aweme_data.get("author", {}).get("avatar_larger")
+            author = aweme_data.get("author", {})
+            avatar_source = author.get("avatar_larger")
             if self._extract_urls(avatar_source):
                 avatar_path = save_dir / f"{file_stem}_avatar.jpg"
-                if await self._download_first_available(
-                    avatar_source,
-                    avatar_path,
-                    session,
-                    headers=self._download_headers(),
-                    optional=True,
-                ):
-                    downloaded_files.append(avatar_path)
+                optional_assets.append(
+                    (
+                        avatar_path,
+                        self._download_first_available(
+                            avatar_source,
+                            avatar_path,
+                            session,
+                            headers=self._download_headers(),
+                            optional=True,
+                        ),
+                    )
+                )
+
+        if optional_assets:
+            # 不变量：登记的协程（_download_first_available / _download_with_retry）
+            # 内部捕获所有 Exception 并返回 False，不会让 gather 抛出——
+            # 往这里登记新的协程时必须保持同样的不抛异常约定。
+            outcomes = await asyncio.gather(*(coro for _, coro in optional_assets))
+            for (asset_path, _), outcome in zip(optional_assets, outcomes):
+                if outcome:
+                    downloaded_files.append(outcome if isinstance(outcome, Path) else asset_path)
 
         if self.config.get("json"):
             json_path = save_dir / f"{file_stem}_data.json"
             if await self.metadata_handler.save_metadata(aweme_data, json_path):
                 downloaded_files.append(json_path)
 
-        comments_cfg = self.config.get("comments") or {}
-        if isinstance(comments_cfg, dict) and comments_cfg.get("enabled"):
-            from core.comments_collector import CommentsCollector
-
-            collector = CommentsCollector(
-                self.api_client,
-                self.metadata_handler,
-                include_replies=bool(comments_cfg.get("include_replies", False)),
-                max_comments=int(comments_cfg.get("max_comments", 0) or 0),
-                page_size=int(comments_cfg.get("page_size", 20) or 20),
-            )
+        comments_cfg = self._comments_config()
+        if comments_cfg is not None:
             comments_path = save_dir / f"{file_stem}_comments.json"
-            saved = await collector.collect_and_save(aweme_id, comments_path)
-            if saved is not None:
+            await self._save_comments(str(aweme_id), comments_path, comments_cfg)
+            # 没取全时盘上可能是部分结果或之前存的文件，有就算产物；缺口由
+            # comments_incomplete_note() 在任务结束时说明。
+            if comments_path.exists():
                 downloaded_files.append(comments_path)
+
+        if not downloaded_files:
+            logger.error(
+                "No assets were downloaded for aweme %s; enable video or another asset option",
+                aweme_id,
+            )
+            return self._note_item_reason(
+                aweme_id, self._no_assets_reason(bool(optional_assets), comments_cfg)
+            )
 
         author = aweme_data.get("author", {})
         if self.database:
             metadata_json = json.dumps(aweme_data, ensure_ascii=False)
+            cover_list = extract_video_cover_urls(aweme_data)
+            if not cover_list:
+                # Image posts carry no video cover — fall back to the first
+                # image's mirrors (same rule as the my-content projection).
+                images = aweme_data.get("images")
+                first_image = images[0] if isinstance(images, list) and images else None
+                if isinstance(first_image, dict):
+                    cover_list = first_image.get("url_list")
             record = {
                 "aweme_id": aweme_id,
                 "aweme_type": media_type,
@@ -538,6 +1021,10 @@ class BaseDownloader(ABC):
                 # the single-write path (add_aweme reads the payload as
                 # fallback when the kwarg is None) pick it up identically.
                 "author_sec_uid": extract_author_sec_uid(aweme_data),
+                "cover_urls": json.dumps(
+                    order_cover_mirrors(cover_list if isinstance(cover_list, list) else [])
+                ),
+                "job_id": self.job_id or "",
             }
             # Caller may opt into batched DB writes by passing a list; we just
             # accumulate the record and let the caller commit them all at once.
@@ -546,10 +1033,19 @@ class BaseDownloader(ABC):
             else:
                 await self.database.add_aweme(record)
 
+        # Same precedence as `_build_aweme_file_context`: a sec_uid the caller
+        # resolved from the profile URL outranks the payload's author block,
+        # which the upstream API sometimes trims.
+        manifest_sec_uid = author_sec_uid or extract_author_sec_uid(aweme_data)
         manifest_record = {
             "date": publish_date,
             "aweme_id": aweme_id,
             "author_name": author.get("nickname", author_name),
+            # Fixed schema — always present, "" when unknown — so manifest
+            # consumers never branch on a missing key. `author_name` alone
+            # cannot survive a nickname change or a collision.
+            "author_sec_uid": manifest_sec_uid or "",
+            "author_url": build_author_home_url(manifest_sec_uid) or "",
             "desc": desc,
             "media_type": media_type,
             "tags": self._extract_tags(aweme_data),
@@ -580,9 +1076,19 @@ class BaseDownloader(ABC):
                     transcript_result.get("error", "unknown"),
                 )
 
-        self._mark_local_aweme_downloaded(aweme_id)
-        logger.info("Downloaded %s: %s (%s)", media_type, desc, aweme_id)
+        if primary_media_downloaded:
+            self._mark_local_aweme_downloaded(aweme_id)
+        logger.info("Downloaded selected assets for %s: %s (%s)", media_type, desc, aweme_id)
         return True
+
+    def _no_assets_reason(self, attempted_optional: bool, comments_cfg: Any) -> str:
+        """一个文件都没落盘时的原因：按勾选配置判断，不能只看排进队列的附件协程——
+        勾了音乐但作品没有音乐地址时根本不会排队。"""
+        if attempted_optional or self.config.get("json") or comments_cfg is not None:
+            return item_reasons.FAIL_OPTIONAL_ASSETS
+        if any(self.config.get(key) for key in ("cover", "music", "avatar")):
+            return item_reasons.FAIL_SELECTED_ASSETS_MISSING
+        return item_reasons.FAIL_NOTHING_SELECTED
 
     async def _download_with_retry(
         self,
@@ -595,6 +1101,7 @@ class BaseDownloader(ABC):
         prefer_response_content_type: bool = False,
         return_saved_path: bool = False,
         retry: bool = True,
+        on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> bool | Path:
         async def _task():
             download_result = await self.file_manager.download_file(
@@ -605,11 +1112,7 @@ class BaseDownloader(ABC):
                 proxy=getattr(self.api_client, "proxy", None),
                 prefer_response_content_type=prefer_response_content_type,
                 return_saved_path=return_saved_path,
-                progress_callback=lambda written, total: self._progress_file_progress(
-                    save_path.name, written, total
-                ),
-                should_pause=self._progress_should_pause,
-                should_cancel=self._progress_should_cancel,
+                on_progress=on_progress,
             )
             if not download_result:
                 raise RuntimeError(f"Download failed for {url}")
@@ -632,15 +1135,23 @@ class BaseDownloader(ABC):
         candidates: List[Tuple[str, Dict[str, str]]],
         save_path: Path,
         session,
+        *,
+        aweme_id: Optional[str] = None,
     ) -> bool:
         """在候选地址间降级下载视频：每轮按序各尝试一次，整轮失败再退避重试。
 
         play 端点的失败多为 302 落点抽签不走运（PCDN 死节点），重试同一
         URL 有意义；直连地址失败（403/过期）则应换下一候选。按轮扫 +
         RetryHandler 退避兼顾两种失败模式，单候选时行为与旧退避重试一致。
+
+        ``_VIDEO_ITEM_DEADLINE_S`` 是整条作品的兜底时限：候选数 × 重试轮数
+        会把每次失败的等待叠起来（旧的单次 total=300s 时最坏 4 轮 × 4 候选
+        ≈ 80 分钟），没有总时限时一条视频就能把整个队列拖死。
         """
         if not candidates:
             return False
+
+        on_progress = self._make_item_progress(aweme_id)
 
         async def _attempt_round() -> bool:
             for url, headers in candidates:
@@ -651,14 +1162,49 @@ class BaseDownloader(ABC):
                     headers=headers,
                     optional=True,
                     retry=False,
+                    on_progress=on_progress,
                 ):
                     return True
             raise RuntimeError(
                 f"All {len(candidates)} video url candidate(s) failed for {save_path.name}"
             )
 
+        return await self._run_within_item_deadline(
+            self.retry_handler.execute_with_retry(_attempt_round), save_path, aweme_id=aweme_id
+        )
+
+    def _discard_if_encrypted(self, video_path: Path, aweme_id: Optional[str]) -> bool:
+        """落盘的 mp4 若是 DRM 密文就删掉并判失败。
+
+        付费作品的 ``download_addr`` 是 CENC 加密的全长正片，容器与 NAL
+        分帧都正常（进度条能拖、时长正确），只有 slice 内容是密文，播放
+        器一律花屏无声。密钥只由抖音授权接口下发，留着这份文件既占空间
+        又会让人误以为下载成功。
+        """
+        scheme = detect_mp4_encryption(video_path)
+        if not scheme:
+            return True
+        self._log_download_error(
+            logger.error,
+            f"Aweme {aweme_id}: 下载到的是 {scheme.upper()} 加密流（付费/会员内容），"
+            f"本地无法播放，已删除 {video_path.name}",
+        )
+        video_path.unlink(missing_ok=True)
+        return False
+
+    async def _run_within_item_deadline(
+        self, awaitable, save_path: Path, *, aweme_id: Optional[str] = None
+    ) -> bool:
+        """给单条作品的下载套上兜底总时限，超时/失败一律归为「这条没下成」。"""
         try:
-            return await self.retry_handler.execute_with_retry(_attempt_round)
+            return await asyncio.wait_for(awaitable, timeout=_VIDEO_ITEM_DEADLINE_S)
+        except asyncio.TimeoutError:
+            self._log_download_error(
+                logger.warning,
+                f"Video download deadline ({_VIDEO_ITEM_DEADLINE_S}s) exceeded "
+                f"for {save_path.name}",
+            )
+            return self._note_item_reason(aweme_id, item_reasons.FAIL_VIDEO_DEADLINE)
         except Exception:
             return False
 
@@ -769,7 +1315,9 @@ class BaseDownloader(ABC):
         if candidates:
             return candidates
 
-        constructed = self._build_signed_play_url(video, play_addr, quality)
+        constructed = self._build_signed_play_url(
+            video, play_addr, quality, paid=is_paid_content(aweme_data)
+        )
         if constructed:
             return [constructed]
         if watermarked_candidate:
@@ -825,8 +1373,10 @@ class BaseDownloader(ABC):
         video: Dict[str, Any],
         play_addr: Dict[str, Any],
         quality: str,
+        *,
+        paid: bool = False,
     ) -> Optional[Tuple[str, Dict[str, str]]]:
-        uri = play_addr.get("uri") or video.get("vid") or video.get("download_addr", {}).get("uri")
+        uri = self._pick_source_uri(video, play_addr, paid=paid)
         if not uri:
             return None
         # Douyin /aweme/v1/play/ accepts a limited set of ratio strings.
@@ -837,6 +1387,10 @@ class BaseDownloader(ABC):
         selected_ratio = f"{short_edge}p"
         normalised_quality = quality.strip().lower()
         ratio_map = {
+            # original 只是 highest 加一次原画探测；走到签名 play 端点这条
+            # 备用链时两者的 ratio 完全一致。列出来是为了让意图可读——未知
+            # 值本来就 fallback 到 1080p。
+            "original": "1080p",
             "highest": "1080p",
             "lowest": "540p",
         }
@@ -856,6 +1410,111 @@ class BaseDownloader(ABC):
         signed_url, ua = self.api_client.build_signed_path("/aweme/v1/play/", params)
         return signed_url, self._download_headers(user_agent=ua)
 
+    # /aweme/v1/play/ 的 ratio=default 会 302 到上传原片。web detail API 的
+    # bit_rate 阶梯不含该档(实测最高档可比原画小 8 倍),原画只能走这里。
+    _ORIGINAL_PROBE_TIMEOUT_SECONDS = 10
+
+    async def _maybe_promote_original_candidate(
+        self,
+        aweme_data: Dict[str, Any],
+        candidates: List[Tuple[str, Dict[str, str]]],
+        session,
+    ) -> List[Tuple[str, Dict[str, str]]]:
+        """original 画质下探测原画,比所选档大时置顶为首选候选。
+
+        置顶前必须比较真实大小:存在超分重编码档大于原画的反例(如
+        7508597705644985612,档 47.4M > 原画 31.7M),盲选原画会降质。
+        置顶的是探测时已跟随 302 的直连 CDN 地址,避免下载时重抽 play
+        端点的 PCDN 落点;探测失败时保持原候选链,行为与旧版一致。
+        """
+        quality = str(self.config.get("video_quality") or "highest").strip().lower()
+        # 探测有代价(原片可达转码档 8 倍体积,每条多一次超时上限 10s 的请求),
+        # 所以它是 original 这一档的显式语义,而不是 highest 的隐含行为——
+        # 藏在 highest 里用户既看不见也关不掉。默认值仍是 highest,即默认不探。
+        if quality != "original":
+            return candidates
+        # 付费作品的 play_addr 就是试看渲染版本身，ratio=default 探到的
+        # 是同一份资产（实测大小逐字节相等），探测只是白搭一次请求；真正
+        # 的「原片」是要不起的 CENC 全长正片，置顶它只会下到一份密文。
+        if is_paid_content(aweme_data):
+            return candidates
+        video = aweme_data.get("video") if isinstance(aweme_data.get("video"), dict) else {}
+        play_addr = self._pick_preferred_play_addr(video, quality) or {}
+        uri = self._pick_source_uri(video, play_addr, paid=is_paid_content(aweme_data))
+        if not uri:
+            return candidates
+        probed = await self._probe_original_play_source(
+            str(uri),
+            session,
+            need_set_cookie=bool(video.get("is_need_set_cookie")),
+        )
+        if not probed:
+            return candidates
+        original_url, original_size = probed
+        try:
+            selected_size = int(play_addr.get("data_size") or 0)
+        except (TypeError, ValueError):
+            selected_size = 0
+        if selected_size and original_size <= selected_size:
+            return candidates
+        return [(original_url, self._download_headers())] + candidates
+
+    async def _probe_original_play_source(
+        self, uri: str, session, *, need_set_cookie: bool = False
+    ) -> Optional[Tuple[str, int]]:
+        """Range 取 1 字节探测原画地址,返回 (302 落点 URL, 文件总大小)。
+
+        content-type 必须是 video/*:WAF 拦截页等 200+HTML 响应不得被
+        误判为原画。任何异常都返回 None,由调用方退回原候选链。
+        """
+        params = {
+            "video_id": uri,
+            "ratio": "default",
+            "line": "0",
+            "is_play_url": "1",
+            "watermark": "0",
+            "source": "PackSourceEnum_PUBLISH",
+        }
+        if need_set_cookie:
+            # 受限作品(video.is_need_set_cookie)官方 App 会附带此标记,
+            # 缺失时 play 端点会拒绝。
+            params["ss_is_p_v_ss"] = "1"
+        signed_url, ua = self.api_client.build_signed_path("/aweme/v1/play/", params)
+        headers = {**self._download_headers(user_agent=ua), "Range": "bytes=0-0"}
+        try:
+            async with session.get(
+                signed_url,
+                headers=headers,
+                allow_redirects=True,
+                proxy=getattr(self.api_client, "proxy", None) or None,
+                timeout=aiohttp.ClientTimeout(total=self._ORIGINAL_PROBE_TIMEOUT_SECONDS),
+            ) as resp:
+                if resp.status not in (200, 206):
+                    raise ValueError(f"unexpected status {resp.status}")
+                if not str(resp.content_type or "").startswith("video/"):
+                    raise ValueError(f"unexpected content-type {resp.content_type}")
+                content_range = str(resp.headers.get("Content-Range") or "")
+                raw_total = (
+                    content_range.rsplit("/", 1)[-1]
+                    if "/" in content_range
+                    else resp.headers.get("Content-Length")
+                )
+                total = int(raw_total or 0)
+                if total <= 0:
+                    raise ValueError(f"missing total size (Content-Range={content_range!r})")
+                return str(resp.url), total
+        except Exception as error:
+            # 探测是 best-effort:任何失败(网络、WAF 403 限速、签名、假
+            # session)都必须退回原候选链,绝不能让主下载流程因此中断。但要
+            # 留下可见线索:play 端点被限速时批量任务会整批降级到可小数倍
+            # 的转码档,只有 debug 日志用户根本无从察觉。复用限量日志防刷屏。
+            self._log_download_error(
+                logger.warning,
+                f"Original-quality probe failed for {uri}: {error}; "
+                "falling back to transcoded tracks",
+            )
+            return None
+
     # 视频画质选择支持的规格名称。值保留为横屏长边尺寸，用于兼容只有
     # width 的旧响应；完整 width/height 响应会按短边匹配 1080p/720p 等档位。
     _QUALITY_TARGET_WIDTH: Dict[str, int] = {
@@ -866,6 +1525,22 @@ class BaseDownloader(ABC):
         "480p": 854,
         "360p": 640,
     }
+
+    @staticmethod
+    def _pick_source_uri(
+        video: Dict[str, Any], play_addr: Dict[str, Any], *, paid: bool = False
+    ) -> Optional[str]:
+        """挑选构造播放地址用的 vid，付费内容跳过 ``download_addr``。
+
+        付费作品的 ``play_addr`` 与 ``download_addr`` 是转码期生成的两份
+        不同资产：前者明文（试看窗口外画面已被预渲染成模糊、音轨静音），
+        后者是 CENC 加密的全长正片。回退到 download_addr 只会下到一份解
+        不开的密文，还不如就用明文的试看版。
+        """
+        uri = play_addr.get("uri") or video.get("vid")
+        if not uri and not paid:
+            uri = (video.get("download_addr") or {}).get("uri")
+        return uri or None
 
     @staticmethod
     def _find_bit_rate_entry(video: Dict[str, Any], play_addr: Dict[str, Any]) -> Dict[str, Any]:
@@ -957,81 +1632,6 @@ class BaseDownloader(ABC):
         entries.sort(key=lambda t: (-t[2], -t[0], -t[1]))
         return entries[0][3]
 
-    def _collect_image_urls(self, aweme_data: Dict[str, Any]) -> List[str]:
-        return [
-            candidates[0]
-            for candidates in self._collect_image_url_candidates(aweme_data)
-            if candidates
-        ]
-
-    def _collect_image_url_candidates(self, aweme_data: Dict[str, Any]) -> List[List[str]]:
-        return [
-            candidates
-            for _gallery_index, candidates, _live_url in self._collect_gallery_assets(
-                aweme_data
-            )
-            if candidates
-        ]
-
-    def _collect_gallery_assets(
-        self, aweme_data: Dict[str, Any]
-    ) -> List[Tuple[int, List[str], Optional[str]]]:
-        """收集图文每一项的图片候选与动图视频地址。
-
-        Returns:
-            [(gallery_index, image_url_candidates, live_video_url)]，与
-            ``_iter_gallery_items`` 的下标一致；既无图片也无动图的项跳过。
-        """
-        gallery_items = self._iter_gallery_items(aweme_data)
-        quality = str(self.config.get("video_quality") or "highest")
-        assets: List[Tuple[int, List[str], Optional[str]]] = []
-        for gallery_index, item in enumerate(gallery_items):
-            if not isinstance(item, dict):
-                continue
-            candidates = self._collect_ranked_media_urls(
-                (item.get("watermark_free_download_url_list"), item, 0),
-                (item.get("origin_image"), item.get("origin_image"), 1),
-                (item.get("display_image"), item.get("display_image"), 2),
-                (item, item, 3),
-                (item.get("download_url"), item.get("download_url"), 4),
-                (item.get("download_addr"), item.get("download_addr"), 5),
-                (item.get("download_url_list"), item, 6),
-                (item.get("owner_watermark_image"), item.get("owner_watermark_image"), 7),
-            )
-            video = item.get("video") if isinstance(item.get("video"), dict) else {}
-            preferred_play_addr = self._pick_preferred_play_addr(video, quality)
-            live_url = self._pick_first_media_url(
-                preferred_play_addr,
-                video.get("play_addr_h264"),
-                video.get("play_addr_265"),
-                video.get("play_addr_256"),
-                video.get("play_addr"),
-                video.get("download_addr"),
-                item.get("video_play_addr"),
-                item.get("video_download_addr"),
-            )
-            if candidates or live_url:
-                assets.append((gallery_index, candidates, live_url))
-        if not assets:
-            logger.warning(
-                "No gallery assets extracted for aweme %s; gallery items count=%d",
-                aweme_data.get("aweme_id"),
-                len(gallery_items),
-            )
-        return assets
-
-    def _collect_image_live_pairs(
-        self, aweme_data: Dict[str, Any]
-    ) -> List[Tuple[int, str]]:
-        """返回 [(gallery_index, live_video_url)]，用于静态图与动图视频配对。"""
-        return [
-            (gallery_index, live_url)
-            for gallery_index, _candidates, live_url in self._collect_gallery_assets(
-                aweme_data
-            )
-            if live_url
-        ]
-
     @staticmethod
     def _pick_preferred_play_addr(
         video: Dict[str, Any], quality: str = "highest"
@@ -1063,28 +1663,84 @@ class BaseDownloader(ABC):
             or (isinstance(video.get("download_addr"), dict) and video["download_addr"].get("uri"))
         )
 
-    def _collect_image_live_urls(self, aweme_data: Dict[str, Any]) -> List[str]:
-        live_urls: List[str] = []
+    def _collect_image_urls(self, aweme_data: Dict[str, Any]) -> List[str]:
+        return [
+            candidates[0]
+            for candidates in self._collect_image_url_candidates(aweme_data)
+            if candidates
+        ]
+
+    def _collect_image_url_candidates(self, aweme_data: Dict[str, Any]) -> List[List[str]]:
+        image_urls = []
+        gallery_items = self._iter_gallery_items(aweme_data)
+        for item in gallery_items:
+            if not isinstance(item, dict):
+                continue
+            candidates = self._image_item_url_candidates(item)
+            if candidates:
+                image_urls.append(candidates)
+        if not image_urls:
+            logger.warning(
+                "No image URLs extracted for aweme %s; gallery items count=%d",
+                aweme_data.get("aweme_id"),
+                len(gallery_items),
+            )
+        return image_urls
+
+    def _image_item_url_candidates(self, item: Dict[str, Any]) -> List[str]:
+        return self._collect_ranked_media_urls(
+            (item.get("watermark_free_download_url_list"), item, 0),
+            (item.get("origin_image"), item.get("origin_image"), 1),
+            (item.get("display_image"), item.get("display_image"), 2),
+            (item, item, 3),
+            (item.get("download_url"), item.get("download_url"), 4),
+            (item.get("download_addr"), item.get("download_addr"), 5),
+            (item.get("download_url_list"), item, 6),
+            (item.get("owner_watermark_image"), item.get("owner_watermark_image"), 7),
+        )
+
+    def _collect_image_live_urls(self, aweme_data: Dict[str, Any]) -> List[Tuple[int, str]]:
+        """返回 (序号, 实况视频地址)，序号与 _collect_image_url_candidates 的图片序号一致。
+
+        按实况出现顺序另起编号时，「实况、静态、实况」的第二段实况会叫 _live_2，
+        和第 3 张图对不上（#239）。没有静态图的实况排在所有图片序号之后，免得撞名。
+        """
         quality = str(self.config.get("video_quality") or "highest")
+        numbered: List[Tuple[int, str]] = []
+        orphans: List[str] = []
+        seen: Set[str] = set()
+        image_index = 0
         for item in self._iter_gallery_items(aweme_data):
             if not isinstance(item, dict):
                 continue
-            video = item.get("video") if isinstance(item.get("video"), dict) else {}
-            # 实况图同样会有 bit_rate 多档，按配置的画质偏好选择对应档位。
-            preferred_play_addr = self._pick_preferred_play_addr(video, quality)
-            live_url = self._pick_first_media_url(
-                preferred_play_addr,
-                video.get("play_addr_h264"),
-                video.get("play_addr_265"),
-                video.get("play_addr_256"),
-                video.get("play_addr"),
-                video.get("download_addr"),
-                item.get("video_play_addr"),
-                item.get("video_download_addr"),
-            )
-            if live_url:
-                live_urls.append(live_url)
-        return self._deduplicate_urls(live_urls)
+            has_image = bool(self._image_item_url_candidates(item))
+            if has_image:
+                image_index += 1
+            live_url = self._pick_image_live_url(item, quality)
+            if not live_url or live_url in seen:
+                continue
+            seen.add(live_url)
+            if has_image:
+                numbered.append((image_index, live_url))
+            else:
+                orphans.append(live_url)
+        numbered.extend((image_index + offset, url) for offset, url in enumerate(orphans, start=1))
+        return numbered
+
+    def _pick_image_live_url(self, item: Dict[str, Any], quality: str) -> Optional[str]:
+        video = item.get("video") if isinstance(item.get("video"), dict) else {}
+        # 实况图同样会有 bit_rate 多档，按配置的画质偏好选择对应档位。
+        preferred_play_addr = self._pick_preferred_play_addr(video, quality)
+        return self._pick_first_media_url(
+            preferred_play_addr,
+            video.get("play_addr_h264"),
+            video.get("play_addr_265"),
+            video.get("play_addr_256"),
+            video.get("play_addr"),
+            video.get("download_addr"),
+            item.get("video_play_addr"),
+            item.get("video_download_addr"),
+        )
 
     @staticmethod
     def _iter_gallery_items(aweme_data: Dict[str, Any]) -> List[Any]:
@@ -1098,17 +1754,6 @@ class BaseDownloader(ABC):
         if isinstance(images, list):
             return images
         return []
-
-    @staticmethod
-    def _deduplicate_urls(urls: List[str]) -> List[str]:
-        deduped: List[str] = []
-        seen: set[str] = set()
-        for url in urls:
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            deduped.append(url)
-        return deduped
 
     @staticmethod
     def _pick_first_media_url(*sources: Any) -> Optional[str]:

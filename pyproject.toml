@@ -3,18 +3,17 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "douyin-downloader"
-version = "2.0.0"
-description = "Douyin batch downloader with no-watermark support"
+name = "douyin-dl-cli"
+version = "2.1.1"
+description = "Free Douyin batch video downloader, providing CLI and AI Agent skill (Claude Code, Codex): batch download, hot board, search, live recording, transcription"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -22,6 +21,9 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp>=3.9.0",
+    # storage/file_manager.py imports httpx at runtime; keep in sync with
+    # requirements.txt or clean-room sidecar builds crash at boot.
+    "httpx>=0.25",
     "aiofiles>=23.2.1",
     "aiosqlite>=0.19.0",
     "rich>=13.7.0",
@@ -34,7 +36,7 @@ dependencies = [
     # reproducible across CI machines. 0.6.0 is the first release that
     # ships a native macOS arm64 wheel; older versions only shipped
     # x86_64 macOS binaries.
-    "imageio-ffmpeg==0.6.0",
+    "imageio-ffmpeg==0.8.1",
 ]
 
 [project.optional-dependencies]
@@ -60,14 +62,19 @@ dev = [
     "hypothesis>=6.0",
 ]
 all = [
-    "douyin-downloader[browser,transcribe,server,dev]",
+    "douyin-dl-cli[browser,transcribe,server,dev]",
 ]
 
 [project.scripts]
 douyin-dl = "cli.main:main"
 
+[project.urls]
+Homepage = "https://github.com/jiji262/douyin-downloader"
+Repository = "https://github.com/jiji262/douyin-downloader"
+Issues = "https://github.com/jiji262/douyin-downloader/issues"
+
 [tool.setuptools.packages.find]
-include = ["cli*", "core*", "auth*", "config*", "control*", "storage*", "utils*", "tools*", "server*"]
+include = ["agent_mode*", "cli*", "core*", "auth*", "config*", "control*", "storage*", "utils*", "tools*", "server*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

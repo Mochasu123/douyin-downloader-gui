@@ -7,12 +7,17 @@ from pathlib import Path
 from typing import Any
 
 from auth import CookieManager
+from cli.login_flow import can_interactive_login, interactive_relogin
 from cli.progress_display import ProgressDisplay
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
-from core import DouyinAPIClient, DownloaderFactory, URLParser
-from core import LoginRequiredError
-from cli.login_flow import can_interactive_login, interactive_relogin
+from core import (
+    UNSUPPORTED_URL_TYPE_DETAIL,
+    DouyinAPIClient,
+    DownloaderFactory,
+    LoginRequiredError,
+    URLParser,
+)
 from storage import Database, FileManager
 from utils.logger import set_console_log_level, setup_logger
 from utils.notifier import build_notifier
@@ -20,6 +25,10 @@ from utils.validators import is_short_url, normalize_short_url
 
 logger = setup_logger("CLI")
 display = ProgressDisplay()
+
+AGENT_SUBCOMMAND = "agent"
+EXIT_ALL_FAILED = 1
+EXIT_LOGIN_REQUIRED = 3
 
 
 def _as_bool(value: Any, default: bool = True) -> bool:
@@ -32,20 +41,32 @@ def _as_bool(value: Any, default: bool = True) -> bool:
     return bool(value)
 
 
-async def _run_with_relogin(make_coro, cookie_manager, *, serve=False):
+def _batch_exit_code(all_results, failed_urls: int, login_failed: bool):
+    """批量下载的退出码：登录失效 3；一条都没成且确有失败 1；其余 None（即 0）。"""
+    if login_failed:
+        return EXIT_LOGIN_REQUIRED
+    done = sum(r.success + r.skipped for r in all_results)
+    failed = failed_urls + sum(r.failed for r in all_results)
+    if done == 0 and failed > 0:
+        return EXIT_ALL_FAILED
+    return None
+
+
+async def _run_with_relogin(make_coro, cookie_manager, *, serve=False, allow_relogin=True):
     """Run make_coro(); on LoginRequiredError, relogin once and retry.
 
     make_coro is a zero-arg callable returning a fresh coroutine each call,
     so the retry re-creates its own DouyinAPIClient with refreshed cookies.
     Refreshed cookies propagate through ``cookie_manager`` as a clean replace
     (not a merge), and both call sites read their cookies from it on retry.
+    allow_relogin=False：本次运行里登录已经失败过，不再弹浏览器，直接抛出。
     """
     for attempt in range(2):
         try:
             return await make_coro()
         except LoginRequiredError as exc:
             interactive = can_interactive_login(serve=serve)
-            if attempt == 1 or not interactive:
+            if attempt == 1 or not interactive or not allow_relogin:
                 display.print_error(
                     f"登录态失效，需要重新登录（status {exc.status_code}）："
                     f"{exc.status_msg or '请先登录'}。"
@@ -61,9 +82,11 @@ async def _run_with_relogin(make_coro, cookie_manager, *, serve=False):
             )
             new_cookies = await interactive_relogin()
             if not new_cookies:
-                display.print_error("重新登录未完成，已中止。")
+                display.print_error("重新登录未完成。")
                 raise
             cookie_manager.set_cookies(new_cookies)
+            # 整条 URL 会重跑，上一轮已结算条目的原因不能再计一遍。
+            display.rollback_url_item_reasons()
             display.print_success("已更新登录态，正在重试…")
 
 
@@ -107,6 +130,16 @@ async def download_url(
             display.print_error(f"Failed to parse URL: {url}")
             return None
 
+        # 能力门禁：这些类型解析得出来，但永远不会有下载器（见
+        # core.downloader_factory.UNSUPPORTED_URL_TYPE_DETAIL）。在建下载器之前
+        # 拦，用户才能看到真实原因而不是 "No downloader found for type: ..."。
+        gated_detail = UNSUPPORTED_URL_TYPE_DETAIL.get(str(parsed.get("type") or ""))
+        if gated_detail:
+            if progress_reporter:
+                progress_reporter.update_step("解析链接", gated_detail)
+            display.print_error(gated_detail)
+            return None
+
         if not progress_reporter:
             display.print_info(f"URL type: {parsed['type']}")
         if progress_reporter:
@@ -135,6 +168,9 @@ async def download_url(
             progress_reporter.advance_step("执行下载", "开始拉取与下载资源")
         try:
             result = await downloader.download(parsed)
+        except LoginRequiredError:
+            # 交给 _run_with_relogin 重新登录后重试；恢复不了时由调用方记为该 URL 失败。
+            raise
         except Exception as exc:
             # Surface fatal downloader errors (e.g. user_info fetch failed
             # because cookies are invalid) as a per-URL failure instead of
@@ -174,6 +210,12 @@ async def download_url(
                 )
             else:
                 progress_reporter.advance_step("收尾", "无可统计结果")
+
+        # 评论没取全不计入失败数，单独提示，免得「失败 0」掩盖了缺的评论。
+        comments_note = getattr(downloader, "comments_incomplete_note", None)
+        note = comments_note() if callable(comments_note) else None
+        if note:
+            display.print_warning(note)
 
         return result
 
@@ -248,11 +290,14 @@ async def main_async(args):
         database = Database(db_path=str(db_path))
         await database.initialize()
         display.print_success("Database initialized")
+    await _recover_live_recordings(database, config)
 
     urls = config.get_links()
     display.print_info(f"Found {len(urls)} URL(s) to process")
 
     all_results = []
+    failed_urls = 0
+    login_failed = False
     progress_config = config.get("progress", {}) or {}
     quiet_by_config = _as_bool(progress_config.get("quiet_logs", True), default=True)
     quiet_progress_logs = quiet_by_config and not (args.verbose or args.show_warnings)
@@ -266,21 +311,31 @@ async def main_async(args):
         for i, url in enumerate(urls, 1):
             display.start_url(i, len(urls), url)
 
-            result = await _run_with_relogin(
-                lambda u=url: download_url(
-                    u,
-                    config,
+            try:
+                result = await _run_with_relogin(
+                    lambda u=url: download_url(
+                        u,
+                        config,
+                        cookie_manager,
+                        database,
+                        progress_reporter=display,
+                    ),
                     cookie_manager,
-                    database,
-                    progress_reporter=display,
-                ),
-                cookie_manager,
-                serve=False,
-            )
+                    serve=False,
+                    # 登录失败过一次就不再重新登录，免得每个 URL 都弹一次浏览器
+                    allow_relogin=not login_failed,
+                )
+            except LoginRequiredError:
+                # 登录恢复不了：这个 URL 记失败，其余 URL 照常处理，最后以退出码 3 收尾
+                login_failed = True
+                failed_urls += 1
+                display.fail_url("登录态失效，需要重新登录")
+                continue
             if result:
                 all_results.append(result)
                 display.complete_url(result)
             else:
+                failed_urls += 1
                 display.fail_url("下载失败或链接无效")
     finally:
         display.stop_download_session()
@@ -301,11 +356,13 @@ async def main_async(args):
 
         display.print_success("\n=== Overall Summary ===")
         display.show_result(total_result)
+        display.show_item_reasons()
 
         await _dispatch_notifications(config, total_result, len(urls))
     else:
         # 所有链接都失败时，也发通知（若启用）
         await _dispatch_notifications(config, None, len(urls))
+    return _batch_exit_code(all_results, failed_urls, login_failed)
 
 
 async def _run_discovery_subcommand(
@@ -316,7 +373,10 @@ async def _run_discovery_subcommand(
 
     base_path = Path(config.get("path") or "./Downloaded/")
 
-    async with DouyinAPIClient(cookie_manager.get_cookies()) as api_client:
+    async with DouyinAPIClient(
+        cookie_manager.get_cookies(),
+        proxy=config.get("proxy"),
+    ) as api_client:
         if args.hot_board is not None:
             display.print_info("拉取抖音热搜榜...")
             result = await dump_hot_board(api_client, base_path, limit=int(args.hot_board or 0))
@@ -330,6 +390,21 @@ async def _run_discovery_subcommand(
                 max_items=int(args.search_max or 50),
             )
             display.print_success(f"搜索结果已保存：{result['count']} 条 -> {result['path']}")
+
+
+async def _recover_live_recordings(database, config: ConfigLoader) -> None:
+    """上次中断（Ctrl+C / 崩溃）留下的直播分段：开始新下载前先转封装并补登记。"""
+    from core.live_finalize import recover_recordings
+    from storage.live_recordings import journal_root
+
+    try:
+        root = journal_root(database, config.get("path"))
+        paths = sorted(root.glob("*.json"))
+        if not paths:
+            return
+        await recover_recordings(root, database=database, paths=paths, retry_deferred=False)
+    except Exception as exc:
+        logger.warning("Live recording recovery failed: %s", exc)
 
 
 async def _run_serve_subcommand(args, config: ConfigLoader) -> None:
@@ -380,6 +455,14 @@ async def _dispatch_notifications(config: ConfigLoader, total_result: Any, url_c
 
 
 def main():
+    if sys.argv[1:2] == [AGENT_SUBCOMMAND]:
+        # agent 模式有自己的参数与输出契约，必须在人用 argparse 之前分发
+        from agent_mode.entry import main as agent_main
+
+        sys.exit(agent_main(sys.argv[2:]))
+
+    from agent_mode.version import get_version
+
     parser = argparse.ArgumentParser(description="Douyin Downloader - 抖音批量下载工具")
     parser.add_argument("-u", "--url", action="append", help="Download URL(s)")
     parser.add_argument("-c", "--config", help="Config file path (default: config.yml)")
@@ -416,11 +499,7 @@ def main():
     )
     parser.add_argument("--serve-host", type=str, default="127.0.0.1", help="REST 服务监听地址")
     parser.add_argument("--serve-port", type=int, default=8000, help="REST 服务监听端口")
-    try:
-        from __init__ import __version__
-    except ImportError:
-        __version__ = "2.0.0"
-    parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument("--version", action="version", version=get_version())
 
     args = parser.parse_args()
 
@@ -432,14 +511,19 @@ def main():
         set_console_log_level(logging.ERROR)
 
     try:
-        asyncio.run(main_async(args))
+        exit_code = asyncio.run(main_async(args))
     except KeyboardInterrupt:
         display.print_warning("\nDownload interrupted by user")
         sys.exit(0)
+    except LoginRequiredError:
+        # 单次操作（--hot-board / --search）登录恢复不了；原因和补救办法已打印
+        sys.exit(EXIT_LOGIN_REQUIRED)
     except Exception as e:
         display.print_error(f"Fatal error: {e}")
         logger.exception("Fatal error occurred")
         sys.exit(1)
+    if isinstance(exit_code, int) and exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

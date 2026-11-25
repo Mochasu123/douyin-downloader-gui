@@ -102,3 +102,106 @@ async def test_download_url_passes_proxy_to_api_client(monkeypatch, tmp_path):
     assert result is not None
     assert result.success == 1
     assert captured["proxy"] == "http://127.0.0.1:8899"
+
+
+@pytest.mark.asyncio
+async def test_discovery_subcommand_passes_proxy_to_api_client(monkeypatch, tmp_path):
+    """--hot-board / --search 与下载共用 DouyinAPIClient,同样必须透传代理。
+
+    与桌面仓的同名测试有意分叉:本仓的 _run_discovery_subcommand 多一个
+    cookie_manager 参数(重登录流程),直接注入 fake 即可。
+    """
+    config = main_module.ConfigLoader()
+    config.update(path=str(tmp_path), proxy="http://127.0.0.1:8899")
+
+    captured = {}
+
+    class _ProxyAPIClient(_FakeAPIClient):
+        def __init__(self, cookies, proxy=None):
+            captured["proxy"] = proxy
+            super().__init__(cookies, proxy=proxy)
+
+    async def _fake_dump_hot_board(_api_client, base_path, limit=0):
+        return {"count": 0, "path": str(base_path)}
+
+    from core import discovery
+
+    monkeypatch.setattr(main_module, "DouyinAPIClient", _ProxyAPIClient)
+    monkeypatch.setattr(discovery, "dump_hot_board", _fake_dump_hot_board)
+
+    args = SimpleNamespace(hot_board=0, search=None, search_max=None)
+    await main_module._run_discovery_subcommand(args, config, _FakeCookieManager())
+
+    assert captured["proxy"] == "http://127.0.0.1:8899"
+
+
+@pytest.mark.asyncio
+async def test_download_url_gates_lvdetail_before_building_a_downloader(monkeypatch, tmp_path):
+    """放映厅版权影视：CLI 必须给出真实原因，而不是
+    "No downloader found for type: lvdetail"。
+
+    门禁要早于 DownloaderFactory.create —— 工厂对这个类型返回 None，
+    真让它走到那一步，用户看到的就是一条毫无信息量的内部错误。
+    """
+    config = main_module.ConfigLoader()
+    config.update(path=str(tmp_path))
+
+    created = []
+    errors = []
+
+    monkeypatch.setattr(main_module, "DouyinAPIClient", _FakeAPIClient)
+    monkeypatch.setattr(
+        main_module.DownloaderFactory,
+        "create",
+        lambda *a, **kw: created.append(a) or None,
+    )
+    monkeypatch.setattr(main_module.display, "print_error", lambda msg: errors.append(msg))
+
+    result = await main_module.download_url(
+        "https://www.douyin.com/lvdetail/6828500371023856142",
+        config,
+        _FakeCookieManager(),
+        database=None,
+        progress_reporter=None,
+    )
+
+    assert result is None
+    assert created == []
+    assert errors == [main_module.UNSUPPORTED_URL_TYPE_DETAIL["lvdetail"]]
+
+
+@pytest.mark.asyncio
+async def test_download_url_warns_when_comments_are_incomplete(monkeypatch, tmp_path):
+    # 评论没取全不计入失败数；CLI 要单独提示，否则只看得到「失败 0」。
+    config = main_module.ConfigLoader()
+    config.update(path=str(tmp_path))
+    note = "2 个作品的评论没取全（评论接口请求失败，可能被抖音限流或登录失效）"
+
+    class _CommentsGapDownloader(_FakeDownloader):
+        def comments_incomplete_note(self):
+            return note
+
+    warnings = []
+    monkeypatch.setattr(main_module, "DouyinAPIClient", _FakeAPIClient)
+    monkeypatch.setattr(
+        main_module.URLParser,
+        "parse",
+        lambda _url: {"type": "video", "aweme_id": "7604129988555574538"},
+    )
+    monkeypatch.setattr(
+        main_module.DownloaderFactory,
+        "create",
+        lambda *_args, **_kwargs: _CommentsGapDownloader(),
+    )
+    monkeypatch.setattr(main_module.display, "print_warning", warnings.append)
+
+    result = await main_module.download_url(
+        "https://www.douyin.com/video/7604129988555574538",
+        config,
+        _FakeCookieManager(),
+        database=None,
+        progress_reporter=None,
+    )
+
+    assert result.failed == 0
+    assert warnings == [note]

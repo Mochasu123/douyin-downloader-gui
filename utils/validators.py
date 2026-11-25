@@ -1,6 +1,15 @@
 import re
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import parse_qs, urlparse
+
+_WINDOWS_RESERVED_STEMS = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 def _host_matches(host: str, base: str) -> bool:
@@ -13,8 +22,14 @@ def _is_douyin_web_host(host: str) -> bool:
 
 def _is_live_replay_path(host: str, path: str) -> bool:
     if _is_douyin_web_host(host):
-        return path.startswith("/vsdetail/")
-    return host == "webcast.amemv.com" and path.startswith("/douyin/webcast/reflow/episode/")
+        return bool(re.fullmatch(r"/vsdetail/\d+/?", path))
+    return host == "webcast.amemv.com" and bool(
+        re.fullmatch(r"/douyin/webcast/reflow/episode/\d+/?", path)
+    )
+
+
+def _is_live_reflow_path(host: str, path: str) -> bool:
+    return host == "webcast.amemv.com" and bool(re.fullmatch(r"/douyin/webcast/reflow/\d+/?", path))
 
 
 def validate_url(url: str) -> bool:
@@ -25,20 +40,25 @@ def validate_url(url: str) -> bool:
         return False
 
 
+# Windows 禁用字符与控制字符;POSIX 只禁 / 与 NUL,取并集保证跨平台可落盘。
+_ILLEGAL_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# 结尾的 . 和空格 Windows 会静默去掉,写入名与实际名对不上;开头的 . 在
+# macOS / Linux 上是隐藏文件。
+_EDGE_STRIP_CHARS = ". "
+
+
 def sanitize_filename(filename: str, max_length: int = 80) -> str:
-    # 换行符 → 空格
+    """只处理真正不能落盘的部分,``#``、连续下划线 / 空格等合法内容原样保留。"""
+    # 换行本身就是控制字符,换成空格比下划线可读
     filename = filename.replace("\n", " ").replace("\r", " ")
-    # Windows 非法字符 + #，逗号 → 下划线
-    filename = re.sub(r'[<>:"/\\|?*#\x00-\x1f]', "_", filename)
-    # 连续下划线 → 单个下划线（保留空格，不再把空格折叠成下划线）
-    filename = re.sub(r"_+", "_", filename)
-    # 连续空格 → 单个空格
-    filename = re.sub(r" +", " ", filename)
-    # 去首尾
-    filename = filename.strip("._- ")
+    filename = _ILLEGAL_FILENAME_CHARS_RE.sub("_", filename)
+    filename = filename.strip(_EDGE_STRIP_CHARS)
 
     if len(filename) > max_length:
-        filename = filename[:max_length].rstrip("._- ")
+        filename = filename[:max_length].rstrip(_EDGE_STRIP_CHARS)
+
+    if filename.split(".", 1)[0].upper() in _WINDOWS_RESERVED_STEMS:
+        filename = f"_{filename}"[:max_length]
 
     return filename or "untitled"
 
@@ -50,18 +70,13 @@ SHORT_URL_HOSTS = (
 )
 
 _URL_LINE_RE = re.compile(
-    r"https?://[^\s\u3000，。；！？、（）【】《》“”‘’]+",
+    r"https?://[^\s\u3000，。；！？、（）【】《》“”‘’\"'<>]+",
     re.IGNORECASE,
 )
 
 
 def extract_url_from_line(text: str) -> Optional[str]:
-    """从粘贴的一行分享文本中提取第一个 http(s) 链接。
-
-    抖音 App 复制的分享文案常带前缀文字与标点，例如：
-    “8.88 复制打开抖音 https://v.douyin.com/xxxx/ 看看”。
-    找不到链接时返回 None。
-    """
+    """从粘贴的一行分享文本中提取第一个 http(s) 链接。"""
     if not text:
         return None
     match = _URL_LINE_RE.search(text)
@@ -69,6 +84,20 @@ def extract_url_from_line(text: str) -> Optional[str]:
         return None
     url = match.group(0).rstrip(".,;:!?)]}>\"'）】》")
     return url or None
+
+
+def extract_all_urls_from_text(text: str) -> List[str]:
+    """从多行混合分享文案中提取所有去重后的 http(s) 链接（保持出现顺序）。"""
+    if not text:
+        return []
+    seen: set = set()
+    urls: List[str] = []
+    for match in _URL_LINE_RE.finditer(text):
+        url = match.group(0).rstrip(".,;:!?)]}>\"'）】》")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 def is_short_url(url: str) -> bool:
@@ -108,6 +137,8 @@ def parse_url_type(url: str) -> Optional[str]:
 
     if _is_live_replay_path(host, path):
         return "live_replay"
+    if _is_live_reflow_path(host, path):
+        return "live"
 
     if not _is_douyin_web_host(host):
         return None
@@ -119,9 +150,16 @@ def parse_url_type(url: str) -> Optional[str]:
     if modal_ids and modal_ids[0].strip():
         return "video"
 
-    # live.douyin.com/{room_id} — 直播间专用子域，path 仅有一段数字。
     if host == "live.douyin.com":
-        return "live"
+        return "live" if re.fullmatch(r"/\d+/?", path) else None
+
+    # 放映厅长视频（版权影视）。识别出来只为给用户一条明确的拒绝理由——
+    # 内容整轨 MPEG-CENC(AES-CTR) 加密，且抖音作品详情接口对这类 id 直接回
+    # filter_reason=lvideo_not_support，任何解析路径都拿不到可播放的成片。
+    # 必须放在 /video/ 之前：以后若有人给这里加宽松正则，先撞上这条拒绝。
+    # 详见 docs/research/douyin-lvdetail-long-video.md。
+    if "/lvdetail/" in path:
+        return "lvdetail"
     if "/video/" in path:
         return "video"
     if "/user/" in path:
@@ -132,6 +170,6 @@ def parse_url_type(url: str) -> Optional[str]:
         return "collection"
     if "/music/" in path:
         return "music"
-    if "/live/" in path or "/follow/live/" in path:
+    if re.fullmatch(r"/(?:follow/|share/)?live/\d+/?", path):
         return "live"
     return None

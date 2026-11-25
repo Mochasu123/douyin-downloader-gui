@@ -2,8 +2,53 @@ import asyncio
 import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiosqlite
+
+
+def order_cover_mirrors(urls: List[Any]) -> List[str]:
+    """封面镜像排序:p3-* 域名 403 概率高,置后;保序截断 3 个。
+
+    Kept identical to the desktop sibling (shared-`aweme` semantics) so
+    both projects persist mirrors in the same order.
+    """
+    cleaned = [u for u in urls if isinstance(u, str) and u]
+    non_p3 = [u for u in cleaned if not urlparse(u).netloc.startswith("p3-")]
+    p3 = [u for u in cleaned if urlparse(u).netloc.startswith("p3-")]
+    return (non_p3 + p3)[:3]
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards so user input matches literally.
+
+    Pair with ``LIKE ? ESCAPE '\\'`` — otherwise a search for ``100%``
+    behaves as a prefix wildcard instead of the literal string.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _cover_urls_from_metadata(metadata: str) -> str:
+    """Extract an ordered cover-mirror JSON array from an aweme metadata blob.
+
+    Returns '' when the blob is empty, unparseable, or carries no
+    ``video.cover.url_list`` — the backfill leaves those rows untouched.
+    """
+    if not metadata:
+        return ""
+    try:
+        meta = json.loads(metadata)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    video = meta.get("video")
+    cover = video.get("cover") if isinstance(video, dict) else None
+    url_list = cover.get("url_list") if isinstance(cover, dict) else None
+    if not isinstance(url_list, list):
+        return ""
+    ordered = order_cover_mirrors(url_list)
+    return json.dumps(ordered) if ordered else ""
 
 
 class Database:
@@ -158,15 +203,130 @@ class Database:
         if "retry_history" not in existing_job_columns:
             await db.execute("ALTER TABLE job ADD COLUMN retry_history TEXT")
 
+        # Incremental migration (2026-07, synced from the desktop sibling):
+        # cover mirrors + job linkage on the shared aweme table. The
+        # one-shot backfill below only runs when the column is first
+        # added, so re-running initialize() never re-scans metadata.
+        if "cover_urls" not in existing_columns:
+            await db.execute(
+                "ALTER TABLE aweme ADD COLUMN cover_urls TEXT NOT NULL DEFAULT ''"
+            )
+            # Commit the ALTER before the backfill so a crash mid-backfill
+            # leaves an explicit (column present, partially filled) state
+            # instead of rolling the column back with the data.
+            await db.commit()
+            # Keyset-paginate: metadata blobs are full aweme-detail JSON
+            # (often 50-300 KB each) — fetching the whole table at once
+            # would spike memory on heavy libraries.
+            last_id = 0
+            while True:
+                cursor = await db.execute(
+                    "SELECT id, metadata FROM aweme "
+                    "WHERE id > ? AND metadata IS NOT NULL AND metadata != '' "
+                    "ORDER BY id LIMIT 500",
+                    (last_id,),
+                )
+                rows = await cursor.fetchall()
+                if not rows:
+                    break
+                updates = []
+                for row_id, metadata in rows:
+                    cover_urls = _cover_urls_from_metadata(metadata)
+                    if cover_urls:
+                        updates.append((cover_urls, row_id))
+                    last_id = row_id
+                if updates:
+                    await db.executemany(
+                        "UPDATE aweme SET cover_urls = ? WHERE id = ?", updates
+                    )
+                await db.commit()
+        if "job_id" not in existing_columns:
+            await db.execute(
+                "ALTER TABLE aweme ADD COLUMN job_id TEXT NOT NULL DEFAULT ''"
+            )
+
         await db.commit()
         self._initialized = True
-        await self._auto_vacuum()
 
     async def is_downloaded(self, aweme_id: str) -> bool:
+        # Row existence is NOT enough: rows can exist with an empty
+        # file_path (e.g. synced from the desktop sibling's my-content
+        # feature). Treating those as "downloaded" would make like-mode
+        # incremental batches stop at the first such row.
         db = await self._get_conn()
-        cursor = await db.execute("SELECT id FROM aweme WHERE aweme_id = ?", (aweme_id,))
+        cursor = await db.execute(
+            "SELECT id FROM aweme WHERE aweme_id = ? "
+            "AND file_path IS NOT NULL AND file_path != ''",
+            (aweme_id,),
+        )
         result = await cursor.fetchone()
         return result is not None
+
+    # Preserving upsert: metadata-ish fields always update, but download
+    # artifacts (file_path / metadata / download_time) and enrichments
+    # (cover_urls / job_id) survive upserts that arrive without them.
+    # Kept identical to the desktop sibling (its my-content sync writes
+    # empty projections that must not clobber downloaded rows).
+    _AWEME_UPSERT_SQL = """
+        INSERT INTO aweme
+        (aweme_id, aweme_type, title, author_id, author_name, author_sec_uid,
+         create_time, download_time, file_path, metadata, cover_urls, job_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(aweme_id) DO UPDATE SET
+          aweme_type = CASE WHEN COALESCE(excluded.aweme_type, '') != ''
+                            THEN excluded.aweme_type
+                            ELSE aweme.aweme_type END,
+          title = CASE WHEN COALESCE(excluded.title, '') != ''
+                       THEN excluded.title
+                       ELSE aweme.title END,
+          author_id = CASE WHEN COALESCE(excluded.author_id, '') != ''
+                           THEN excluded.author_id
+                           ELSE aweme.author_id END,
+          author_name = CASE WHEN COALESCE(excluded.author_name, '') != ''
+                             THEN excluded.author_name
+                             ELSE aweme.author_name END,
+          author_sec_uid = CASE WHEN COALESCE(excluded.author_sec_uid, '') != ''
+                                THEN excluded.author_sec_uid
+                                ELSE aweme.author_sec_uid END,
+          create_time = CASE WHEN COALESCE(excluded.create_time, 0) != 0
+                             THEN excluded.create_time
+                             ELSE aweme.create_time END,
+          download_time = CASE WHEN COALESCE(excluded.file_path, '') != ''
+                               THEN excluded.download_time
+                               ELSE aweme.download_time END,
+          file_path = CASE WHEN COALESCE(excluded.file_path, '') != ''
+                           THEN excluded.file_path
+                           ELSE aweme.file_path END,
+          metadata = CASE WHEN COALESCE(excluded.metadata, '') != ''
+                          THEN excluded.metadata
+                          ELSE aweme.metadata END,
+          cover_urls = CASE WHEN excluded.cover_urls != '' AND excluded.cover_urls != '[]'
+                            THEN excluded.cover_urls
+                            ELSE aweme.cover_urls END,
+          job_id = CASE WHEN excluded.job_id != ''
+                        THEN excluded.job_id
+                        ELSE aweme.job_id END
+    """
+
+    @staticmethod
+    def _aweme_upsert_row(
+        item: Dict[str, Any], sec_uid: Optional[str], now_ts: int
+    ) -> tuple:
+        file_path = item.get("file_path") or ""
+        return (
+            item.get("aweme_id"),
+            item.get("aweme_type"),
+            item.get("title"),
+            item.get("author_id"),
+            item.get("author_name"),
+            sec_uid,
+            item.get("create_time"),
+            now_ts if file_path else None,
+            item.get("file_path"),
+            item.get("metadata"),
+            item.get("cover_urls") or "",
+            item.get("job_id") or "",
+        )
 
     async def add_aweme(
         self,
@@ -179,63 +339,33 @@ class Database:
         # callers (tests, legacy downloaders) keep working.
         sec_uid = author_sec_uid if author_sec_uid is not None else aweme_data.get("author_sec_uid")
         await db.execute(
-            """
-            INSERT OR REPLACE INTO aweme
-            (aweme_id, aweme_type, title, author_id, author_name, author_sec_uid,
-             create_time, download_time, file_path, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                aweme_data.get("aweme_id"),
-                aweme_data.get("aweme_type"),
-                aweme_data.get("title"),
-                aweme_data.get("author_id"),
-                aweme_data.get("author_name"),
-                sec_uid,
-                aweme_data.get("create_time"),
-                int(datetime.now().timestamp()),
-                aweme_data.get("file_path"),
-                aweme_data.get("metadata"),
-            ),
+            self._AWEME_UPSERT_SQL,
+            self._aweme_upsert_row(aweme_data, sec_uid, int(datetime.now().timestamp())),
         )
         await db.commit()
 
     async def add_aweme_batch(self, items: List[Dict[str, Any]]) -> None:
-        """Insert N awemes in a single transaction. Replaces existing rows by aweme_id."""
+        """Upsert N awemes in a single transaction (same preserving semantics
+        as :meth:`add_aweme`)."""
         if not items:
             return
         db = await self._get_conn()
         now_ts = int(datetime.now().timestamp())
         rows = [
-            (
-                item.get("aweme_id"),
-                item.get("aweme_type"),
-                item.get("title"),
-                item.get("author_id"),
-                item.get("author_name"),
-                item.get("author_sec_uid"),
-                item.get("create_time"),
-                now_ts,
-                item.get("file_path"),
-                item.get("metadata"),
-            )
+            self._aweme_upsert_row(item, item.get("author_sec_uid"), now_ts)
             for item in items
         ]
-        await db.executemany(
-            """
-            INSERT OR REPLACE INTO aweme
-            (aweme_id, aweme_type, title, author_id, author_name, author_sec_uid,
-             create_time, download_time, file_path, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            rows,
-        )
+        await db.executemany(self._AWEME_UPSERT_SQL, rows)
         await db.commit()
 
     async def get_latest_aweme_time(self, author_id: str) -> Optional[int]:
+        # Same downloaded-only rule as is_downloaded(): non-downloaded rows
+        # must not poison the author increment baseline.
         db = await self._get_conn()
         cursor = await db.execute(
-            "SELECT MAX(create_time) FROM aweme WHERE author_id = ?", (author_id,)
+            "SELECT MAX(create_time) FROM aweme WHERE author_id = ? "
+            "AND file_path IS NOT NULL AND file_path != ''",
+            (author_id,),
         )
         result = await cursor.fetchone()
         return result[0] if result and result[0] else None
@@ -259,105 +389,6 @@ class Database:
         )
         await db.commit()
 
-    async def add_parse_history(
-        self, entry: Dict[str, Any], *, per_kind_limit: int = 200
-    ) -> bool:
-        """记录一条成功解析的历史；同 kind+content_id+name 只保留首次。
-
-        Returns:
-            是否真正插入了新记录（重复解析返回 False）。
-        """
-        db = await self._get_conn()
-        kind = str(entry.get("kind") or "")
-        content_id = str(entry.get("content_id") or "")
-        name = (str(entry.get("name") or "")).strip() or "未知"
-        cursor = await db.execute(
-            """
-            INSERT OR IGNORE INTO parse_history
-            (kind, content_id, name, original_url, resolved_url,
-             author_name, avatar_url, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                kind,
-                content_id,
-                name,
-                str(entry.get("original_url") or ""),
-                str(entry.get("resolved_url") or ""),
-                str(entry.get("author_name") or ""),
-                str(entry.get("avatar_url") or ""),
-                entry.get("created_at")
-                or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            ),
-        )
-        await db.commit()
-        inserted = cursor.rowcount > 0
-        if inserted and per_kind_limit > 0 and kind:
-            await db.execute(
-                """
-                DELETE FROM parse_history
-                WHERE kind = ? AND id NOT IN (
-                    SELECT id FROM parse_history
-                    WHERE kind = ? ORDER BY created_at DESC, id DESC LIMIT ?
-                )
-                """,
-                (kind, kind, per_kind_limit),
-            )
-            await db.commit()
-        return inserted
-
-    async def list_parse_history(
-        self,
-        *,
-        kinds: Optional[List[str]] = None,
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        """列出解析历史，最新在前。kind 为空表示全部类型。"""
-        db = await self._get_conn()
-        columns = (
-            "id", "kind", "content_id", "name", "original_url",
-            "resolved_url", "author_name", "avatar_url", "created_at",
-        )
-        sql = (
-            f"SELECT {', '.join(columns)} FROM parse_history "
-            "ORDER BY created_at DESC, id DESC LIMIT ?"
-        )
-        params: List[Any] = [limit]
-        if kinds:
-            placeholders = ", ".join("?" for _ in kinds)
-            sql = (
-                f"SELECT {', '.join(columns)} FROM parse_history "
-                f"WHERE kind IN ({placeholders}) "
-                "ORDER BY created_at DESC, id DESC LIMIT ?"
-            )
-            params = [*kinds, limit]
-        cursor = await db.execute(sql, params)
-        rows = await cursor.fetchall()
-        return [dict(zip(columns, row)) for row in rows]
-
-    async def delete_parse_history(self, ids: List[int]) -> int:
-        """按主键删除历史记录，返回删除条数。"""
-        ids = [int(i) for i in ids if str(i).isdigit()]
-        if not ids:
-            return 0
-        db = await self._get_conn()
-        placeholders = ", ".join("?" for _ in ids)
-        cursor = await db.execute(
-            f"DELETE FROM parse_history WHERE id IN ({placeholders})", ids)
-        await db.commit()
-        return cursor.rowcount
-
-    async def clear_parse_history(self, kind: Optional[str] = None) -> int:
-        """清空解析历史（可只清某类），返回删除条数。"""
-        db = await self._get_conn()
-        if kind:
-            cursor = await db.execute(
-                "DELETE FROM parse_history WHERE kind = ?", (kind,))
-        else:
-            cursor = await db.execute("DELETE FROM parse_history")
-        await db.commit()
-        return cursor.rowcount
-
     async def get_aweme_history(
         self,
         *,
@@ -368,19 +399,33 @@ class Database:
         date_to: Optional[int] = None,
         aweme_type: Optional[str] = None,
         title: Optional[str] = None,
+        author_sec_uid: Optional[str] = None,
+        job_id: Optional[str] = None,
+        sort: str = "download_time",
     ) -> Dict[str, Any]:
-        """Paginated aweme history, newest download first.
+        """Paginated aweme history, newest download first by default.
 
         `date_from` / `date_to` are unix-seconds (filter against `create_time`).
         `aweme_type` matches the `aweme_type` column (e.g. 'video', 'gallery').
-        `title` is a case-insensitive substring match on the title column.
+        `title` and `author` are case-insensitive substring matches;
+        `author_sec_uid` and `job_id` are exact.
+        `sort` is ``download_time`` (default) or ``create_time`` — both DESC.
         """
         db = await self._get_conn()
-        where: list = []
+        # Rows without a file_path carry no downloaded artifact (the desktop
+        # sibling's my-content sync inserts such rows) — History is a
+        # download log, so they are always excluded.
+        where: list = ["file_path IS NOT NULL AND file_path != ''"]
         params: list = []
         if author:
-            where.append("author_name = ?")
-            params.append(author)
+            where.append("LOWER(COALESCE(author_name, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(author.lower())}%")
+        if author_sec_uid:
+            where.append("author_sec_uid = ?")
+            params.append(author_sec_uid)
+        if job_id:
+            where.append("job_id = ?")
+            params.append(job_id)
         if date_from is not None:
             where.append("create_time >= ?")
             params.append(int(date_from))
@@ -391,22 +436,39 @@ class Database:
             where.append("aweme_type = ?")
             params.append(aweme_type)
         if title:
-            where.append("LOWER(COALESCE(title, '')) LIKE ?")
-            params.append(f"%{title.lower()}%")
+            where.append("LOWER(COALESCE(title, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(title.lower())}%")
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
         cursor = await db.execute(f"SELECT COUNT(*) FROM aweme {where_sql}", params)
         row = await cursor.fetchone()
         total = int(row[0]) if row else 0
 
+        order_sql = (
+            "create_time DESC, id DESC"
+            if sort == "create_time"
+            else "download_time DESC, id DESC"
+        )
         offset = max(0, (page - 1) * size)
         cursor = await db.execute(
             f"SELECT aweme_id, aweme_type, title, author_id, author_name, "
-            f"author_sec_uid, create_time, download_time, file_path FROM aweme "
-            f"{where_sql} ORDER BY download_time DESC, id DESC LIMIT ? OFFSET ?",
+            f"author_sec_uid, create_time, download_time, file_path, cover_urls, job_id "
+            f"FROM aweme {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
             params + [int(size), int(offset)],
         )
         rows = await cursor.fetchall()
+
+        def _parse_covers(raw: Any) -> List[str]:
+            if not raw:
+                return []
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                return []
+            if not isinstance(parsed, list):
+                return []
+            return [u for u in parsed if isinstance(u, str) and u]
+
         items = [
             {
                 "aweme_id": r[0],
@@ -418,6 +480,8 @@ class Database:
                 "create_time": r[6],
                 "download_time": r[7],
                 "file_path": r[8],
+                "cover_urls": _parse_covers(r[9]),
+                "job_id": r[10] or "",
             }
             for r in rows
         ]
@@ -434,8 +498,11 @@ class Database:
 
         Aggregates rows in `aweme` with ``create_time >= now - days*86400`` and
         non-empty / non-null ``author_sec_uid``. Groups by ``author_sec_uid``
-        and orders by ``COUNT(*) DESC, author_sec_uid ASC`` (stable tie-break
+        and orders by ``download_count DESC, author_sec_uid ASC`` (stable tie-break
         so property tests are deterministic). Truncates to ``limit`` rows.
+        One live recording split into segments (``aweme_id`` =
+        ``live_<recording_id>_part-NNNNNN``) counts once; since ``aweme_id`` is
+        unique, every other row counts exactly as ``COUNT(*)`` did.
 
         ``author_name`` for each result row is the latest non-empty
         ``author_name`` for that ``sec_uid`` (ordered by ``download_time``
@@ -456,7 +523,11 @@ class Database:
                        AND a2.author_name != ''
                      ORDER BY a2.download_time DESC
                      LIMIT 1) AS author_name,
-                   COUNT(*) AS download_count
+                   COUNT(DISTINCT CASE
+                       WHEN a.aweme_type = 'live' AND instr(a.aweme_id, '_part-') > 0
+                       THEN substr(a.aweme_id, 1, instr(a.aweme_id, '_part-') - 1)
+                       ELSE a.aweme_id
+                   END) AS download_count
               FROM aweme a
              WHERE a.create_time >= ?
                AND a.author_sec_uid IS NOT NULL
@@ -759,25 +830,158 @@ class Database:
             )
         return result
 
-    async def _auto_vacuum(self) -> None:
-        """Vacuum the database if the file exceeds 100 MB on disk.
-
-        Long-running instances accumulate free pages from deleted rows
-        (history pruning, batch insert-or-replace).  A periodic vacuum
-        reclaims that space and keeps the file manageable.
-        """
-        import os
-        try:
-            size_mb = os.path.getsize(self.db_path) / (1024 * 1024)
-        except OSError:
-            return
-        if size_mb < 100:
-            return
+    async def add_parse_history(
+        self, entry: Dict[str, Any], *, per_kind_limit: int = 200
+    ) -> bool:
+        """记录一条成功解析的历史；同 kind+content_id+name 只保留首次。"""
         db = await self._get_conn()
-        if self._conn_lock is None:
-            self._conn_lock = asyncio.Lock()
-        async with self._conn_lock:
-            await db.execute("VACUUM")
+        kind = str(entry.get("kind") or "")
+        content_id = str(entry.get("content_id") or "")
+        name = (str(entry.get("name") or "")).strip() or "未知"
+        cursor = await db.execute(
+            """
+            INSERT OR IGNORE INTO parse_history
+            (kind, content_id, name, original_url, resolved_url,
+             author_name, avatar_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                kind,
+                content_id,
+                name,
+                str(entry.get("original_url") or ""),
+                str(entry.get("resolved_url") or ""),
+                str(entry.get("author_name") or ""),
+                str(entry.get("avatar_url") or ""),
+                entry.get("created_at")
+                or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        await db.commit()
+        inserted = cursor.rowcount > 0
+        if inserted and per_kind_limit > 0 and kind:
+            await db.execute(
+                """
+                DELETE FROM parse_history
+                WHERE kind = ? AND id NOT IN (
+                    SELECT id FROM parse_history
+                    WHERE kind = ? ORDER BY created_at DESC, id DESC LIMIT ?
+                )
+                """,
+                (kind, kind, per_kind_limit),
+            )
+            await db.commit()
+        return inserted
+
+    async def list_parse_history(
+        self,
+        *,
+        kinds: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """列出解析历史，最新在前。kind 为空表示全部类型。"""
+        db = await self._get_conn()
+        columns = (
+            "id", "kind", "content_id", "name", "original_url",
+            "resolved_url", "author_name", "avatar_url", "created_at",
+        )
+        sql = (
+            f"SELECT {', '.join(columns)} FROM parse_history "
+            "ORDER BY created_at DESC, id DESC LIMIT ?"
+        )
+        params: List[Any] = [limit]
+        if kinds:
+            placeholders = ", ".join("?" for _ in kinds)
+            sql = (
+                f"SELECT {', '.join(columns)} FROM parse_history "
+                f"WHERE kind IN ({placeholders}) "
+                "ORDER BY created_at DESC, id DESC LIMIT ?"
+            )
+            params = [*kinds, limit]
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        return [dict(zip(columns, row)) for row in rows]
+
+    async def delete_parse_history(self, ids: List[int]) -> int:
+        """按主键删除历史记录，返回删除条数。"""
+        ids = [int(i) for i in ids if str(i).isdigit()]
+        if not ids:
+            return 0
+        db = await self._get_conn()
+        placeholders = ", ".join("?" for _ in ids)
+        cursor = await db.execute(
+            f"DELETE FROM parse_history WHERE id IN ({placeholders})", ids)
+        await db.commit()
+        return cursor.rowcount
+
+    async def clear_parse_history(self, kind: Optional[str] = None) -> int:
+        """清空解析历史（可只清某类），返回删除条数。"""
+        db = await self._get_conn()
+        if kind:
+            cursor = await db.execute(
+                "DELETE FROM parse_history WHERE kind = ?", (kind,))
+        else:
+            cursor = await db.execute("DELETE FROM parse_history")
+        await db.commit()
+        return cursor.rowcount
+
+    async def get_history_stats(self) -> Dict[str, Any]:
+        """返回下载记录总览统计与近 7 天新增、活跃博主。"""
+        db = await self._get_conn()
+        base_where = "file_path IS NOT NULL AND file_path != ''"
+        cursor = await db.execute(
+            f"""
+            SELECT
+                COUNT(*),
+                SUM(CASE WHEN aweme_type = 'video' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN aweme_type = 'gallery' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN aweme_type = 'music' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN aweme_type IN ('live', 'live_replay') THEN 1 ELSE 0 END),
+                COUNT(DISTINCT NULLIF(author_name, ''))
+            FROM aweme
+            WHERE {base_where}
+            """
+        )
+        row = await cursor.fetchone()
+        total = int(row[0] or 0) if row else 0
+        video_count = int(row[1] or 0) if row else 0
+        gallery_count = int(row[2] or 0) if row else 0
+        music_count = int(row[3] or 0) if row else 0
+        live_count = int(row[4] or 0) if row else 0
+        author_count = int(row[5] or 0) if row else 0
+
+        recent_cutoff = int(datetime.now().timestamp()) - 7 * 86400
+        cursor = await db.execute(
+            f"SELECT COUNT(*) FROM aweme WHERE {base_where} AND download_time >= ?",
+            (recent_cutoff,),
+        )
+        recent_row = await cursor.fetchone()
+        recent_7d = int(recent_row[0] or 0) if recent_row else 0
+
+        cursor = await db.execute(
+            f"""
+            SELECT author_name, COUNT(*) AS cnt
+            FROM aweme
+            WHERE {base_where} AND author_name IS NOT NULL AND author_name != ''
+            GROUP BY author_name
+            ORDER BY cnt DESC, author_name ASC
+            LIMIT 8
+            """
+        )
+        top_authors = [
+            {"author_name": r[0], "count": int(r[1])}
+            for r in await cursor.fetchall()
+        ]
+        return {
+            "total_count": total,
+            "video_count": video_count,
+            "gallery_count": gallery_count,
+            "music_count": music_count,
+            "live_count": live_count,
+            "author_count": author_count,
+            "recent_7d_count": recent_7d,
+            "top_authors": top_authors,
+        }
 
     async def close(self):
         if self._conn is not None:

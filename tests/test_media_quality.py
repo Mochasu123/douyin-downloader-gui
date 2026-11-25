@@ -143,6 +143,17 @@ class TestPickPlayAddrByQuality:
         assert best is not None
         assert best["url_list"] == ["https://1080p-width-only/v"]
 
+    def test_original_picks_same_tier_as_highest(self):
+        """original 只是「highest + 探测原画」，挑档阶段必须与 highest 完全一致。
+
+        锁住这条，防止后来者给 _pick_play_addr_by_quality 加 original 分支：
+        未知值落默认分支（最高分辨率）本身就是正确行为。
+        """
+        video = self._three_tier_video()
+        assert BaseDownloader._pick_play_addr_by_quality(
+            video, "original"
+        ) is BaseDownloader._pick_play_addr_by_quality(video, "highest")
+
     def test_lowest_picks_min_bit_rate(self):
         video = self._three_tier_video()
         best = BaseDownloader._pick_play_addr_by_quality(video, "lowest")
@@ -201,25 +212,7 @@ class TestPickPlayAddrByQuality:
 def test_collect_image_live_urls_prefers_high_bitrate(tmp_path):
     """实况图解析应优先采用 bit_rate 最高的 play_addr。"""
     # 用真实的 VideoDownloader 实例化来验证（_collect_image_live_urls 是实例方法）。
-    from auth import CookieManager
-    from config import ConfigLoader
-    from control import QueueManager, RateLimiter, RetryHandler
-    from core.api_client import DouyinAPIClient
-    from core.video_downloader import VideoDownloader
-    from storage import FileManager
-
-    config = ConfigLoader()
-    config.update(path=str(tmp_path))
-    downloader = VideoDownloader(
-        config,
-        DouyinAPIClient({}),
-        FileManager(str(tmp_path)),
-        CookieManager(str(tmp_path / ".cookies.json")),
-        database=None,
-        rate_limiter=RateLimiter(max_per_second=5),
-        retry_handler=RetryHandler(max_retries=1),
-        queue_manager=QueueManager(max_workers=1),
-    )
+    downloader = _build_video_downloader(tmp_path)
 
     aweme_data = {
         "image_post_info": {
@@ -244,7 +237,7 @@ def test_collect_image_live_urls_prefers_high_bitrate(tmp_path):
     }
 
     urls = downloader._collect_image_live_urls(aweme_data)
-    assert urls == ["https://high.example/live"]
+    assert urls == [(1, "https://high.example/live")]
 
 
 def test_note_aweme_without_gallery_assets_falls_back_to_video(tmp_path):
@@ -314,43 +307,4 @@ def test_collect_image_live_urls_uses_h264_variant_when_play_addr_missing(tmp_pa
     }
 
     urls = downloader._collect_image_live_urls(aweme_data)
-    assert urls == ["https://v3-web.douyinvod.com/live-h264.mp4"]
-
-
-def test_collect_gallery_assets_pairs_still_and_live_video(tmp_path):
-    """图文合并需要知道“第几张静态图 ↔ 第几段动图视频”的配对关系。"""
-    downloader = _build_video_downloader(tmp_path)
-
-    aweme_data = {
-        "image_post_info": {
-            "images": [
-                {
-                    "display_image": {"url_list": ["https://example.com/1.webp"]},
-                    "video": {"play_addr": {"url_list": ["https://example.com/1_live.mp4"]}},
-                },
-                # 只有动图视频、没有静态图
-                {"video": {"play_addr": {"url_list": ["https://example.com/2_live.mp4"]}}},
-                {
-                    "display_image": {"url_list": ["https://example.com/3.webp"]},
-                    "video": {"play_addr": {"url_list": ["https://example.com/3_live.mp4"]}},
-                },
-            ]
-        }
-    }
-
-    assets = downloader._collect_gallery_assets(aweme_data)
-    assert assets == [
-        (0, ["https://example.com/1.webp"], "https://example.com/1_live.mp4"),
-        (1, [], "https://example.com/2_live.mp4"),
-        (2, ["https://example.com/3.webp"], "https://example.com/3_live.mp4"),
-    ]
-    assert downloader._collect_image_live_pairs(aweme_data) == [
-        (0, "https://example.com/1_live.mp4"),
-        (1, "https://example.com/2_live.mp4"),
-        (2, "https://example.com/3_live.mp4"),
-    ]
-    # 只有动图视频的项不应产生“空图片候选”，避免下载循环出错
-    assert downloader._collect_image_url_candidates(aweme_data) == [
-        ["https://example.com/1.webp"],
-        ["https://example.com/3.webp"],
-    ]
+    assert urls == [(1, "https://v3-web.douyinvod.com/live-h264.mp4")]

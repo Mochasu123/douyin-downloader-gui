@@ -8,7 +8,9 @@ import pytest
 from auth import CookieManager
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
+from core import item_reasons
 from core.api_client import DouyinAPIClient
+from core.metadata import extract_video_cover_urls
 from core.video_downloader import VideoDownloader
 from storage import FileManager
 
@@ -18,6 +20,7 @@ class _FakeProgressReporter:
         self.step_updates = []
         self.item_totals = []
         self.item_events = []
+        self.item_outcomes = []
 
     def update_step(self, step: str, detail: str = "") -> None:
         self.step_updates.append((step, detail))
@@ -25,8 +28,9 @@ class _FakeProgressReporter:
     def set_item_total(self, total: int, detail: str = "") -> None:
         self.item_totals.append((total, detail))
 
-    def advance_item(self, status: str, detail: str = "") -> None:
+    def advance_item(self, status: str, detail: str = "", reason: str = "") -> None:
         self.item_events.append((status, detail))
+        self.item_outcomes.append((status, detail, reason))
 
 
 def _build_downloader(tmp_path):
@@ -51,6 +55,28 @@ def _build_downloader(tmp_path):
     return downloader, api_client
 
 
+def test_extract_video_cover_urls_prefers_original_cover():
+    aweme = {
+        "video": {
+            "origin_cover": {"url_list": ["https://example.com/original.jpg"]},
+            "cover": {"url_list": ["https://example.com/preview.jpg"]},
+        }
+    }
+
+    assert extract_video_cover_urls(aweme) == ["https://example.com/original.jpg"]
+
+
+def test_extract_video_cover_urls_falls_back_to_preview_cover():
+    aweme = {
+        "video": {
+            "origin_cover": {"url_list": []},
+            "cover": {"url_list": ["https://example.com/preview.jpg"]},
+        }
+    }
+
+    assert extract_video_cover_urls(aweme) == ["https://example.com/preview.jpg"]
+
+
 @pytest.mark.asyncio
 async def test_video_downloader_skip_counts_total(tmp_path, monkeypatch):
     downloader, api_client = _build_downloader(tmp_path)
@@ -66,6 +92,86 @@ async def test_video_downloader_skip_counts_total(tmp_path, monkeypatch):
     assert result.skipped == 1
     assert result.success == 0
     assert result.failed == 0
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_new_downloader_rescans_disk_after_external_file_deletion(tmp_path):
+    aweme_id = "7412345678901234567"
+    media_path = tmp_path / f"2026-08-21_demo_{aweme_id}.mp4"
+    media_path.write_bytes(b"existing-media")
+
+    first, first_api = _build_downloader(tmp_path)
+    assert await first._should_download(aweme_id) is False
+
+    media_path.unlink()
+    second, second_api = _build_downloader(tmp_path)
+    assert await second._should_download(aweme_id) is True
+
+    await first_api.close()
+    await second_api.close()
+
+
+class _HistoryDatabase:
+    def __init__(self, downloaded: bool):
+        self.downloaded = downloaded
+        self.calls = 0
+
+    async def is_downloaded(self, _aweme_id):
+        self.calls += 1
+        return self.downloaded
+
+
+@pytest.mark.asyncio
+async def test_missing_file_redownloads_by_default_without_history_lookup(tmp_path):
+    downloader, api_client = _build_downloader(tmp_path)
+    history = _HistoryDatabase(downloaded=True)
+    downloader.database = history
+
+    assert await downloader._should_download("7412345678901234567") is True
+    assert history.calls == 0
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_file_skips_when_download_history_is_trusted(tmp_path):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(redownload_missing_files=False)
+    history = _HistoryDatabase(downloaded=True)
+    downloader.database = history
+
+    assert await downloader._should_download("7412345678901234567") is False
+    assert history.calls == 1
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_file_downloads_when_history_record_was_deleted(tmp_path):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(redownload_missing_files=False)
+    history = _HistoryDatabase(downloaded=False)
+    downloader.database = history
+
+    assert await downloader._should_download("7412345678901234567") is True
+    assert history.calls == 1
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_existing_file_skips_before_deleted_history_is_checked(tmp_path):
+    aweme_id = "7412345678901234567"
+    (tmp_path / f"2026-08-21_demo_{aweme_id}.mp4").write_bytes(b"existing-media")
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(redownload_missing_files=False)
+    history = _HistoryDatabase(downloaded=False)
+    downloader.database = history
+
+    assert await downloader._should_download(aweme_id) is False
+    assert history.calls == 0
 
     await api_client.close()
 
@@ -93,9 +199,78 @@ async def test_video_downloader_reports_item_progress(tmp_path, monkeypatch):
 
     assert result.total == 1
     assert result.success == 1
-    assert reporter.item_totals == [(1, "单视频下载")]
-    assert ("下载作品", "单视频资源下载中") in reporter.step_updates
+    assert reporter.item_totals == [(1, "单作品下载")]
+    assert ("下载作品", "单作品资源下载中") in reporter.step_updates
     assert reporter.item_events == [("success", "123")]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_detail_failure_records_item_reason(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    async def _fake_should_download(self, _aweme_id):
+        return True
+
+    async def _fake_get_video_detail(_aweme_id: str):
+        return None
+
+    downloader._should_download = _fake_should_download.__get__(downloader, VideoDownloader)
+    monkeypatch.setattr(api_client, "get_video_detail", _fake_get_video_detail)
+
+    result = await downloader.download({"aweme_id": "123"})
+
+    assert result.failed == 1
+    # 任务中心靠它显示失败原因；为空时只能显示「原因未知」。
+    assert downloader.item_reason_summary() == {
+        "failed": [{"reason": item_reasons.FAIL_DETAIL_UNAVAILABLE, "count": 1}]
+    }
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_existing_video_skip_row_carries_local_file_reason(tmp_path):
+    aweme_id = "7552196871758843145"
+    (tmp_path / f"2026-02-18_demo_{aweme_id}.mp4").write_bytes(b"1")
+    downloader, api_client = _build_downloader(tmp_path)
+    reporter = _FakeProgressReporter()
+    downloader.progress_reporter = reporter
+
+    result = await downloader.download({"aweme_id": aweme_id})
+
+    assert result.skipped == 1
+    assert reporter.item_outcomes == [("skipped", aweme_id, item_reasons.SKIP_LOCAL_FILE_EXISTS)]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via_history", [False, True])
+async def test_existing_video_detail_failure_reports_detail_reason(
+    tmp_path, monkeypatch, via_history
+):
+    """已下载 + 开启评论时仍会取详情；取详情失败的行必须写真实原因，不能沿用跳过原因。"""
+    aweme_id = "7552196871758843145"
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(comments={"enabled": True})
+    if via_history:
+        downloader.config.update(redownload_missing_files=False)
+        downloader.database = _HistoryDatabase(downloaded=True)
+    else:
+        (tmp_path / f"2026-02-18_demo_{aweme_id}.mp4").write_bytes(b"1")
+    reporter = _FakeProgressReporter()
+    downloader.progress_reporter = reporter
+    monkeypatch.setattr(api_client, "get_video_detail", AsyncMock(return_value=None))
+
+    result = await downloader.download({"aweme_id": aweme_id})
+
+    assert result.failed == 1
+    assert reporter.item_outcomes == [("failed", aweme_id, item_reasons.FAIL_DETAIL_UNAVAILABLE)]
+    assert downloader.item_reason_summary() == {
+        "failed": [{"reason": item_reasons.FAIL_DETAIL_UNAVAILABLE, "count": 1}]
+    }
 
     await api_client.close()
 
@@ -468,6 +643,20 @@ async def test_should_download_skips_when_aweme_exists_locally(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_should_download_does_not_treat_cover_as_primary_media(tmp_path):
+    downloader, api_client = _build_downloader(tmp_path)
+    aweme_id = "7600223638943468864"
+
+    cover_file = tmp_path / f"2026-02-18_demo_{aweme_id}_cover.jpg"
+    cover_file.write_bytes(b"1")
+
+    should_download = await downloader._should_download(aweme_id)
+    assert should_download is True
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
 async def test_download_aweme_assets_uses_publish_date_and_writes_manifest(tmp_path, monkeypatch):
     downloader, api_client = _build_downloader(tmp_path)
     downloader.config.update(music=False, cover=False, avatar=False, json=False, folderstyle=True)
@@ -614,6 +803,145 @@ async def test_download_aweme_assets_video_writes_cover_avatar_and_json(tmp_path
     assert any(path.name.endswith("_avatar.jpg") for path in saved_paths)
     metadata_files = list(tmp_path.rglob("*_data.json"))
     assert len(metadata_files) == 1
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_video_false_skips_mp4_but_keeps_selected_sidecars(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        video=False,
+        music=True,
+        cover=True,
+        avatar=False,
+        json=True,
+        folderstyle=True,
+        transcript={"enabled": False},
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+
+    attempted = []
+    saved_paths = []
+
+    async def _fake_download_with_retry(self, url, save_path, _session, **_kwargs):
+        attempted.append(url)
+        saved_paths.append(save_path)
+        return True
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    aweme_data = {
+        "aweme_id": "7600224486650121600",
+        "desc": "仅归档附加资源",
+        "author": {"nickname": "测试作者"},
+        "music": {"play_url": {"url_list": ["https://example.com/music.mp3"]}},
+        "video": {
+            "play_addr": {"url_list": ["https://example.com/video.mp4"]},
+            "origin_cover": {"url_list": ["https://example.com/original.jpg"]},
+            "cover": {"url_list": ["https://example.com/preview.jpg"]},
+        },
+    }
+
+    success = await downloader._download_aweme_assets(
+        aweme_data, author_name="测试作者", mode="post"
+    )
+
+    assert success is True
+    assert "https://example.com/video.mp4" not in attempted
+    assert "https://example.com/original.jpg" in attempted
+    assert "https://example.com/preview.jpg" not in attempted
+    assert "https://example.com/music.mp3" in attempted
+    assert not any(path.suffix == ".mp4" for path in saved_paths)
+    assert len(list(tmp_path.rglob("*_data.json"))) == 1
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_video_download_remains_enabled_when_config_key_is_omitted(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=True,
+        transcript={"enabled": False},
+    )
+    downloader.config.config.pop("video", None)
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+
+    attempted = []
+
+    async def _fake_download_with_retry(self, url, _save_path, _session, **_kwargs):
+        attempted.append(url)
+        return True
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    success = await downloader._download_aweme_assets(
+        {
+            "aweme_id": "7600224486650121601",
+            "desc": "旧配置默认下载视频",
+            "video": {"play_addr": {"url_list": ["https://example.com/video.mp4"]}},
+        },
+        author_name="测试作者",
+        mode="post",
+    )
+
+    assert success is True
+    assert "https://example.com/video.mp4" in attempted
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_video_false_does_not_disable_gallery_images(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        video=False,
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=True,
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+
+    attempted = []
+
+    async def _fake_download_with_retry(self, url, _save_path, _session, **_kwargs):
+        attempted.append(url)
+        return True
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    success = await downloader._download_aweme_assets(
+        {
+            "aweme_id": "7600224486650121602",
+            "aweme_type": 68,
+            "desc": "图集不受视频开关影响",
+            "images": [{"url_list": ["https://example.com/gallery.jpg"]}],
+        },
+        author_name="测试作者",
+        mode="post",
+    )
+
+    assert success is True
+    assert attempted == ["https://example.com/gallery.jpg"]
 
     await api_client.close()
 
@@ -1098,6 +1426,52 @@ async def test_download_aweme_assets_gallery_fails_when_live_video_download_fail
     await api_client.close()
 
 
+@pytest.mark.asyncio
+async def test_gallery_live_photo_index_matches_its_image(tmp_path, monkeypatch):
+    """#239：实况视频的序号要和对应静态图一致，不能按实况出现顺序另起编号。"""
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(music=False, cover=False, avatar=False, json=False, folderstyle=True)
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+
+    saved_paths = []
+
+    async def _fake_download_with_retry(self, _url, save_path, _session, **_kwargs):
+        saved_paths.append(save_path)
+        return True
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    def _image(number, live=False):
+        item = {"display_image": {"url_list": ["https://example.com/%d.webp" % number]}}
+        if live:
+            item["video"] = {
+                "play_addr": {"url_list": ["https://example.com/%d_live.mp4" % number]}
+            }
+        return item
+
+    aweme_data = {
+        "aweme_id": "7600224486650121531",
+        "desc": "实况与静态混排",
+        "image_post_info": {"images": [_image(1, live=True), _image(2), _image(3, live=True)]},
+    }
+
+    success = await downloader._download_aweme_assets(
+        aweme_data, author_name="测试作者", mode="post"
+    )
+
+    assert success is True
+    images = sorted(p.name.rsplit("_", 1)[1] for p in saved_paths if p.suffix == ".webp")
+    lives = sorted(p.name.rsplit("_live_", 1)[1] for p in saved_paths if "_live_" in p.name)
+    assert images == ["1.webp", "2.webp", "3.webp"]
+    assert lives == ["1.mp4", "3.mp4"]
+
+    await api_client.close()
+
+
 def test_detect_media_type_by_aweme_type(tmp_path):
     """aweme_type 2/68/150 should be detected as gallery even without images key."""
     downloader, api_client = _build_downloader(tmp_path)
@@ -1266,3 +1640,182 @@ def test_iter_gallery_items_top_level_image_list(tmp_path):
     assert len(items) == 1
 
     asyncio.run(api_client.close())
+
+
+def _paid_aweme_without_direct_urls():
+    """付费作品：play_addr 无可用直连 URL，只剩 uri 与 download_addr 可构造。"""
+    return {
+        "aweme_id": "7640058716376583458",
+        "charge_info": {
+            "is_charge_content": True,
+            "has_paid": False,
+            "preview_config": {"is_preview": True, "start_time": 0, "end_time": 180000},
+        },
+        "video": {
+            "play_addr": {"uri": "", "url_list": [], "data_size": 163679958},
+            "download_addr": {
+                "uri": "v0d00fg10000d83f1svog65hmig36qeg",
+                "url_list": [],
+                "data_size": 59874426,
+            },
+        },
+    }
+
+
+async def test_paid_content_never_falls_back_to_download_addr(tmp_path):
+    """付费作品的 download_addr 是 CENC 密文，不能作为兜底源。"""
+    downloader, _ = _build_downloader(tmp_path)
+    aweme = _paid_aweme_without_direct_urls()
+
+    assert downloader._build_video_url_candidates(aweme) == []
+
+
+async def test_free_content_still_falls_back_to_download_addr(tmp_path):
+    """免费作品的 play_addr 与 download_addr 是同一资产，兜底行为保持不变。"""
+    downloader, _ = _build_downloader(tmp_path)
+    aweme = _paid_aweme_without_direct_urls()
+    aweme["charge_info"] = None
+
+    candidates = downloader._build_video_url_candidates(aweme)
+
+    assert len(candidates) == 1
+    assert "v0d00fg10000d83f1svog65hmig36qeg" in candidates[0][0]
+
+
+async def test_encrypted_download_is_discarded(tmp_path):
+    """落盘的 CENC 密文必须删除并判失败，而不是当作下载成功。"""
+    import struct
+
+    downloader, _ = _build_downloader(tmp_path)
+
+    def box(box_type, payload=b""):
+        return struct.pack(">I", 8 + len(payload)) + box_type + payload
+
+    sinf = box(
+        b"sinf",
+        box(b"frma", b"avc1") + box(b"schm", b"\x00\x00\x00\x00" + b"cenc" + b"\x00\x01\x00\x00"),
+    )
+    stsd = box(
+        b"stsd",
+        b"\x00\x00\x00\x00" + struct.pack(">I", 1) + box(b"encv", b"\x00" * 78 + sinf),
+    )
+    moov = box(b"moov", box(b"trak", box(b"mdia", box(b"minf", box(b"stbl", stsd)))))
+    video_path = tmp_path / "paid.mp4"
+    video_path.write_bytes(box(b"ftyp", b"isom") + moov)
+
+    assert downloader._discard_if_encrypted(video_path, "7640058716376583458") is False
+    assert not video_path.exists()
+
+
+async def test_plaintext_download_is_kept(tmp_path):
+    """明文 mp4 不受影响，检测失败也不该误删正常文件。"""
+    import struct
+
+    downloader, _ = _build_downloader(tmp_path)
+
+    def box(box_type, payload=b""):
+        return struct.pack(">I", 8 + len(payload)) + box_type + payload
+
+    stsd = box(
+        b"stsd",
+        b"\x00\x00\x00\x00" + struct.pack(">I", 1) + box(b"avc1", b"\x00" * 78),
+    )
+    moov = box(b"moov", box(b"trak", box(b"mdia", box(b"minf", box(b"stbl", stsd)))))
+    video_path = tmp_path / "free.mp4"
+    video_path.write_bytes(box(b"ftyp", b"isom") + moov)
+
+    assert downloader._discard_if_encrypted(video_path, "123") is True
+    assert video_path.exists()
+
+
+async def test_paid_content_skips_original_quality_probe(tmp_path):
+    """付费作品不做 ratio=default 原画探测：探到的是同一份试看资产（实测
+    大小逐字节相等），真正的「原片」是要不起的 CENC 全长正片。"""
+    downloader, _ = _build_downloader(tmp_path)
+    # 必须显式选 original：默认的 highest 根本不探测，那样这条用例就算删掉
+    # 付费护栏也照样通过——测的是空气。
+    downloader.config.update(video_quality="original")
+    aweme = {
+        "charge_info": {"is_charge_content": True, "has_paid": False},
+        "video": {"play_addr": {"uri": "v0200abc", "data_size": 163679958}},
+    }
+    candidates = [("https://v26-web.douyinvod.com/plain.mp4", {})]
+    probed = False
+
+    async def _fail_if_probed(*args, **kwargs):
+        nonlocal probed
+        probed = True
+        return ("https://cdn.example.com/original.mp4", 10**12)
+
+    downloader._probe_original_play_source = _fail_if_probed
+
+    result = await downloader._maybe_promote_original_candidate(aweme, candidates, None)
+
+    assert probed is False
+    assert result == candidates
+
+
+async def test_free_content_still_probes_original_quality(tmp_path):
+    """免费作品的原画探测行为保持不变。"""
+    downloader, _ = _build_downloader(tmp_path)
+    downloader.config.update(video_quality="original")
+    aweme = {
+        "charge_info": None,
+        "video": {"play_addr": {"uri": "v0300abc", "data_size": 1000}},
+    }
+    candidates = [("https://v26-web.douyinvod.com/plain.mp4", {})]
+
+    async def _probe(*args, **kwargs):
+        return ("https://cdn.example.com/original.mp4", 99999)
+
+    downloader._probe_original_play_source = _probe
+
+    result = await downloader._maybe_promote_original_candidate(aweme, candidates, None)
+
+    assert result[0][0] == "https://cdn.example.com/original.mp4"
+
+
+async def test_encrypted_video_aborts_before_recording_success(tmp_path, monkeypatch):
+    """密文被丢弃后，这条作品不得进入 DB / 本地索引，也不得留下文件。"""
+    import struct
+
+    downloader, _ = _build_downloader(tmp_path)
+
+    def box(box_type, payload=b""):
+        return struct.pack(">I", 8 + len(payload)) + box_type + payload
+
+    sinf = box(
+        b"sinf",
+        box(b"frma", b"avc1") + box(b"schm", b"\x00\x00\x00\x00" + b"cenc" + b"\x00\x01\x00\x00"),
+    )
+    stsd = box(
+        b"stsd",
+        b"\x00\x00\x00\x00" + struct.pack(">I", 1) + box(b"encv", b"\x00" * 78 + sinf),
+    )
+    ciphertext = box(b"ftyp", b"isom") + box(
+        b"moov", box(b"trak", box(b"mdia", box(b"minf", box(b"stbl", stsd))))
+    )
+
+    async def _fake_download(candidates, save_path, session, **kwargs):
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_bytes(ciphertext)
+        return True
+
+    marked = []
+    monkeypatch.setattr(downloader, "_download_video_with_fallback", _fake_download)
+    monkeypatch.setattr(downloader, "_mark_local_aweme_downloaded", lambda i: marked.append(i))
+    monkeypatch.setattr(downloader.api_client, "get_session", AsyncMock(return_value=None))
+
+    aweme = {
+        "aweme_id": "7640058716376583458",
+        "desc": "paid",
+        "create_time": 1747353600,
+        "charge_info": {"is_charge_content": True, "has_paid": False},
+        "video": {"play_addr": {"uri": "v0200abc", "url_list": ["https://cdn/x.mp4"]}},
+    }
+
+    ok = await downloader._download_aweme_assets(aweme, "作者", "post")
+
+    assert ok is False
+    assert marked == []
+    assert not list(tmp_path.rglob("*.mp4"))

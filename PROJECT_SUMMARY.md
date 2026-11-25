@@ -10,19 +10,21 @@
 
 ## 2. 当前实现能力（按代码现状）
 
+> **⚠️ 2026-08 起抖音 Argus 风控门禁陆续覆盖作品详情、主页作品、合集、音乐与点赞 / 收藏接口，下列多数下载能力在 CLI 中已无法使用**，详见 README「限制说明」。
+
 ### 2.1 已支持
 
 - 单个视频下载（`/video/{aweme_id}`）
 - 单个图文下载（`/note/{note_id}`）
 - 抖音短链下载（`https://v.douyin.com/...`，会先解析后下载）
 - 用户主页发布作品批量下载（`/user/{sec_uid}` + `mode: [post]`）
-- 无水印优先下载，支持封面/音乐/头像/原始 JSON
+- 可同时保存封面/音乐/头像/原始 JSON
 - 并发下载、重试、速率限制
 - 基于作品发布时间（`create_time`）生成文件名/目录日期前缀（`YYYY-MM-DD_...`）
 - 生成独立下载清单文件 `download_manifest.jsonl`
 - 时间过滤（`start_time` / `end_time`）
 - 数量限制（当前对 `number.post` 生效）
-- SQLite 去重与增量下载（当前对 `increase.post` 生效）
+- 基于磁盘主文件的增量下载：文件存在则跳过，缺失或为空则重新下载
 - 翻页受限时的浏览器兜底（采集 `aweme_id` 并补全详情）
 
 ### 2.2 已新增（本次实现）
@@ -30,7 +32,7 @@
 - 用户点赞下载（`mode: [like]`）
 - 用户合集下载（`mode: [mix]`）与单合集链接（`/collection/{mix_id}`、`/mix/{mix_id}`）
 - 用户音乐模式下载（`mode: [music]`）与单音乐链接（`/music/{music_id}`）
-- `number.like` / `number.mix` / `number.music` 与 `increase.like` / `increase.mix` / `increase.music` 生效
+- `number.like` / `number.mix` / `number.music` 与各模式的磁盘增量开关生效
 - `number.allmix` / `increase.allmix` 兼容保留，并在加载时归一化到 `mix`
 
 
@@ -93,7 +95,8 @@ Downloaded/
   - `aweme`：作品明细、作者、发布时间、下载时间、保存路径、原始 metadata
   - `download_history`：每次任务 URL、类型、总数、成功数、配置快照
 
-> 当 `database: false` 时，不写 SQLite，但**仍会写**媒体文件和 `download_manifest.jsonl`。
+> SQLite 只记录历史，不参与增量跳过判断。当 `database: false` 时，不写 SQLite，
+> 但**仍会写**媒体文件和 `download_manifest.jsonl`。
 
 
 ## 5. 关键流程（简版）
@@ -101,7 +104,7 @@ Downloaded/
 1. 读取配置（命令行 > 环境变量 > 配置文件 > 默认配置）
 2. 初始化 Cookie 与 API 客户端
 3. 解析链接类型（视频 / 图文 / 用户）
-4. 拉取作品数据并应用时间/数量/增量规则
+4. 拉取作品数据并应用时间、数量、媒体类型等范围筛选
 5. 并发下载媒体文件
 6. 写入可选 JSON 元数据
 7. 追加写入 `download_manifest.jsonl`

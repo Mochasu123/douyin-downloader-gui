@@ -49,6 +49,10 @@ desktop_settings.json
 desktop_self_test.*
 .omx/
 
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+
 # Editor / IDE local settings
 .claude/
 .idea/

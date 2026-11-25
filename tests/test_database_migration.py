@@ -12,9 +12,11 @@ Covers task 1.2 of the desktop-ux-overhaul spec:
 6. Empty list is a no-op returning 0; duplicate ids don't double-count.
 """
 
+import json
+
 import aiosqlite
 
-from storage.database import Database
+from storage.database import Database, order_cover_mirrors
 
 # ---------------------------------------------------------------------------
 # Legacy DDL: the `aweme` table as it existed BEFORE the `author_sec_uid`
@@ -272,3 +274,113 @@ async def test_delete_aweme_by_ids_dedupes_duplicate_ids(tmp_path):
         assert await db.is_downloaded("a") is False
     finally:
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. cover_urls / job_id / entry_order / follow_rank migrations
+#    (2026-07-02 page-review-improvements spec, Task 1)
+# ---------------------------------------------------------------------------
+def test_order_cover_mirrors_puts_p3_last_and_caps_at_three():
+    urls = [
+        "https://p3-sign.douyinpic.com/a.jpg",
+        "https://p26-sign.douyinpic.com/a.jpg",
+        "https://p9-sign.douyinpic.com/a.jpg",
+        "https://p11-sign.douyinpic.com/a.jpg",
+    ]
+    assert order_cover_mirrors(urls) == [
+        "https://p26-sign.douyinpic.com/a.jpg",
+        "https://p9-sign.douyinpic.com/a.jpg",
+        "https://p11-sign.douyinpic.com/a.jpg",
+    ]
+    assert order_cover_mirrors([]) == []
+    assert order_cover_mirrors([None, "", "https://p9-x/c.jpg"]) == ["https://p9-x/c.jpg"]
+
+
+async def test_migration_adds_cover_urls_and_backfills_from_metadata(tmp_path):
+    db_path = str(tmp_path / "legacy.db")
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(_LEGACY_AWEME_DDL)
+        await conn.execute(
+            "INSERT INTO aweme (aweme_id, aweme_type, title, metadata) VALUES (?, ?, ?, ?)",
+            (
+                "legacy_1",
+                "video",
+                "t",
+                json.dumps(
+                    {
+                        "video": {
+                            "cover": {
+                                "url_list": [
+                                    "https://p3-sign.douyinpic.com/a.jpg",
+                                    "https://p26-sign.douyinpic.com/a.jpg",
+                                ]
+                            }
+                        }
+                    }
+                ),
+            ),
+        )
+        # A row with unparseable metadata must not break the backfill.
+        await conn.execute(
+            "INSERT INTO aweme (aweme_id, aweme_type, metadata) VALUES (?, ?, ?)",
+            ("legacy_bad", "video", "{not json"),
+        )
+        await conn.commit()
+
+    db = Database(db_path=db_path)
+    await db.initialize()
+    try:
+        cols = await _table_columns(db_path, "aweme")
+        assert "cover_urls" in cols
+        assert "job_id" in cols
+
+        conn = await db._get_conn()
+        cursor = await conn.execute(
+            "SELECT cover_urls FROM aweme WHERE aweme_id = ?", ("legacy_1",)
+        )
+        (cover_urls,) = await cursor.fetchone()
+        # p3 mirror sorted last by the backfill.
+        assert json.loads(cover_urls) == [
+            "https://p26-sign.douyinpic.com/a.jpg",
+            "https://p3-sign.douyinpic.com/a.jpg",
+        ]
+
+        cursor = await conn.execute(
+            "SELECT cover_urls FROM aweme WHERE aweme_id = ?", ("legacy_bad",)
+        )
+        (bad_cover,) = await cursor.fetchone()
+        assert bad_cover == ""
+    finally:
+        await db.close()
+
+
+async def test_cover_backfill_runs_only_at_migration_time(tmp_path):
+    """Backfill is tied to the column-add; later initialize() must not re-run it."""
+    db_path = str(tmp_path / "t.db")
+    db = Database(db_path=db_path)
+    await db.initialize()
+    try:
+        conn = await db._get_conn()
+        await conn.execute(
+            "INSERT INTO aweme (aweme_id, aweme_type, metadata, cover_urls) VALUES (?, ?, ?, '')",
+            (
+                "post_migration",
+                "video",
+                json.dumps({"video": {"cover": {"url_list": ["https://p9-x/c.jpg"]}}}),
+            ),
+        )
+        await conn.commit()
+    finally:
+        await db.close()
+
+    db2 = Database(db_path=db_path)
+    await db2.initialize()
+    try:
+        conn = await db2._get_conn()
+        cursor = await conn.execute(
+            "SELECT cover_urls FROM aweme WHERE aweme_id = ?", ("post_migration",)
+        )
+        (cover_urls,) = await cursor.fetchone()
+        assert cover_urls == ""  # untouched: backfill only runs when the column is added
+    finally:
+        await db2.close()

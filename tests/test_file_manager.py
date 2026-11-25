@@ -1,6 +1,11 @@
+import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from storage.file_manager import FileManager
 
@@ -215,9 +220,7 @@ def test_get_save_path_group_by_mode_false_keeps_leaf_folder(tmp_path):
 def test_get_save_path_group_by_mode_true_default_keeps_mode(tmp_path):
     """Default (omitted) keeps the mode folder — zero behaviour change."""
     fm = FileManager(str(tmp_path))
-    path = fm.get_save_path(
-        "某作者", mode="post", aweme_title="T", aweme_id="1", folderstyle=False
-    )
+    path = fm.get_save_path("某作者", mode="post", aweme_title="T", aweme_id="1", folderstyle=False)
     assert path.parts[-1] == "post"
     assert path.parts[-2] == "某作者"
 
@@ -247,9 +250,7 @@ def test_get_save_path_collection_dir_is_sanitized(tmp_path):
 
     fm = FileManager(str(tmp_path))
     raw = "a/b:c*d?"
-    path = fm.get_save_path(
-        "A", mode="mix", folderstyle=False, collection_dir=raw
-    )
+    path = fm.get_save_path("A", mode="mix", folderstyle=False, collection_dir=raw)
     # folderstyle off → the collection folder is the leaf.
     assert path.name == sanitize_filename(raw)
     assert "/" not in path.name
@@ -260,9 +261,7 @@ def test_get_save_path_collection_dir_empty_keeps_legacy_layout(tmp_path):
     change for every non-mix caller."""
     fm = FileManager(str(tmp_path))
     for empty in ("", None, "   "):
-        path = fm.get_save_path(
-            "A", mode="mix", folderstyle=False, collection_dir=empty
-        )
+        path = fm.get_save_path("A", mode="mix", folderstyle=False, collection_dir=empty)
         assert path.name == "mix"
         assert path.parent.name == "A"
 
@@ -372,20 +371,282 @@ async def test_download_file_atomic_write(tmp_path):
     assert not save_path.with_suffix(".mp4.tmp").exists()
 
 
+def _aiohttp_session_returning_status(status):
+    """Build a mock aiohttp session whose ``get`` yields a response with the
+    given HTTP status (and no body — the non-200 path never reads content)."""
+    mock_response = AsyncMock()
+    mock_response.status = status
+
+    ctx = AsyncMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_response)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = MagicMock()
+    mock_session.get.return_value = ctx
+    return mock_session
+
+
+class _FakeHttpxResponse:
+    def __init__(self, status_code, content, headers):
+        self.status_code = status_code
+        self._content = content
+        self.headers = headers
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aiter_bytes(self):
+        yield self._content
+
+
+class _FakeHttpxClient:
+    def __init__(self, response, calls):
+        self._response = response
+        self._calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def stream(self, method, url, headers=None):
+        self._calls.append((method, url, headers))
+        return self._response
+
+
+class _CloseTrackingHttpxClient(_FakeHttpxClient):
+    def __init__(self, response, closed):
+        super().__init__(response, [])
+        self._closed = closed
+
+    async def aclose(self):
+        self._closed.set()
+
+
+_THREAD_EVENT_TIMEOUT_S = 5.0
+
+
+async def _wait_for_thread_event(event, timeout=_THREAD_EVENT_TIMEOUT_S):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not event.is_set():
+        if asyncio.get_running_loop().time() >= deadline:
+            pytest.fail("worker thread event was not set before timeout")
+        await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+async def test_download_file_falls_back_to_httpx_on_403(tmp_path, monkeypatch):
+    """Douyin's image CDN 403s aiohttp's TLS fingerprint for some assets
+    (e.g. ``biz_tag=pcweb_cover`` covers) while serving httpx/curl. On a 403
+    we must retry the same URL via httpx and persist the result."""
+    fm = FileManager(str(tmp_path))
+    save_path = tmp_path / "cover.jpg"
+    content = b"jpeg-bytes-from-httpx"
+
+    calls = []
+    response = _FakeHttpxResponse(
+        200, content, {"Content-Type": "image/jpeg", "Content-Length": str(len(content))}
+    )
+    monkeypatch.setattr(
+        "storage.file_manager.httpx.AsyncClient",
+        lambda *a, **k: _FakeHttpxClient(response, calls),
+    )
+
+    result = await fm.download_file(
+        "https://p3-pc-sign.douyinpic.com/cover.jpg",
+        save_path,
+        session=_aiohttp_session_returning_status(403),
+    )
+
+    assert result is True
+    assert save_path.exists()
+    assert save_path.read_bytes() == content
+    assert not save_path.with_suffix(".jpg.tmp").exists()
+    assert len(calls) == 1  # httpx was actually used
+
+
+@pytest.mark.asyncio
+async def test_httpx_fallback_keeps_event_loop_responsive_during_client_setup(
+    tmp_path, monkeypatch
+):
+    """Slow synchronous HTTPX setup must not starve sidecar health requests."""
+    fm = FileManager(str(tmp_path))
+    response = _FakeHttpxResponse(
+        200,
+        b"cover",
+        {"Content-Type": "image/jpeg", "Content-Length": "5"},
+    )
+    setup_started = threading.Event()
+    release_setup = threading.Event()
+    released_while_setting_up = []
+
+    def _slow_client(*args, **kwargs):
+        setup_started.set()
+        released_while_setting_up.append(release_setup.wait(timeout=_THREAD_EVENT_TIMEOUT_S))
+        return _FakeHttpxClient(response, [])
+
+    async def _heartbeat():
+        while not setup_started.is_set():
+            await asyncio.sleep(0)
+        release_setup.set()
+
+    monkeypatch.setattr("storage.file_manager.httpx.AsyncClient", _slow_client)
+    heartbeat = asyncio.create_task(_heartbeat())
+
+    result = await fm.download_file(
+        "https://p3-pc-sign.douyinpic.com/cover.jpg",
+        tmp_path / "cover.jpg",
+        session=_aiohttp_session_returning_status(403),
+    )
+    await heartbeat
+
+    assert result is True
+    assert released_while_setting_up == [True]
+
+
+@pytest.mark.asyncio
+async def test_httpx_fallback_closes_client_when_cancelled_during_setup(tmp_path, monkeypatch):
+    """Cancellation must not orphan a client that the worker finishes constructing."""
+    fm = FileManager(str(tmp_path))
+    response = _FakeHttpxResponse(200, b"cover", {"Content-Type": "image/jpeg"})
+    setup_started = threading.Event()
+    release_setup = threading.Event()
+    setup_finished = threading.Event()
+    client_closed = threading.Event()
+
+    def _blocking_client(*args, **kwargs):
+        setup_started.set()
+        release_setup.wait(timeout=_THREAD_EVENT_TIMEOUT_S)
+        client = _CloseTrackingHttpxClient(response, client_closed)
+        setup_finished.set()
+        return client
+
+    monkeypatch.setattr("storage.file_manager.httpx.AsyncClient", _blocking_client)
+    task = asyncio.create_task(
+        fm.download_file(
+            "https://p3-pc-sign.douyinpic.com/cover.jpg",
+            tmp_path / "cover.jpg",
+            session=_aiohttp_session_returning_status(403),
+        )
+    )
+
+    await _wait_for_thread_event(setup_started)
+    task.cancel()
+    release_setup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _wait_for_thread_event(setup_finished)
+
+    assert client_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_download_file_no_httpx_fallback_on_404(tmp_path, monkeypatch):
+    """A genuine 404 (dead/expired asset) must NOT trigger the httpx fallback —
+    falling back on every non-200 would double every doomed request."""
+    fm = FileManager(str(tmp_path))
+    save_path = tmp_path / "gone.jpg"
+
+    calls = []
+
+    def _boom(*a, **k):
+        calls.append((a, k))
+        raise AssertionError("httpx must not be called on 404")
+
+    monkeypatch.setattr("storage.file_manager.httpx.AsyncClient", _boom)
+
+    result = await fm.download_file(
+        "https://example.com/gone.jpg",
+        save_path,
+        session=_aiohttp_session_returning_status(404),
+    )
+
+    assert result is False
+    assert not save_path.exists()
+    assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_download_file_sets_granular_timeouts(tmp_path):
     """/aweme/v1/play/ 302 后可能落到打不通的 PCDN 节点（高位端口 SYN 黑洞），
-    没有 connect 细分超时时握手会把 total=300s 全部耗光（线上日志实测两次
-    重试间隔正好 300s），批量任务队尾因此长时间停滞。"""
+    没有 connect 细分超时时握手会一直挂着，批量任务队尾因此长时间停滞。
+    整次下载不设总时长（#256），卡死只靠连接 / 读间隙上限与吞吐地板兜住。"""
     fm = FileManager(str(tmp_path))
     session = _aiohttp_session_returning_status(404)
 
     await fm.download_file("https://example.com/v.mp4", tmp_path / "v.mp4", session=session)
 
     timeout = session.get.call_args.kwargs["timeout"]
-    assert timeout.total == 300
+    assert timeout.total is None
     assert timeout.connect == 15
     assert timeout.sock_read == 60
+
+
+def _local_server(handler):
+    """真实本地 HTTP 服务：mock 的 session 不会触发 aiohttp 自己的超时计时。"""
+    app = web.Application()
+    app.router.add_get("/v.mp4", handler)
+    return TestServer(app)
+
+
+@pytest.mark.asyncio
+async def test_download_file_keeps_long_healthy_stream(tmp_path, monkeypatch):
+    """#256：超长视频 / 直播回放一直有数据时，不能被固定总时长掐断。
+
+    旧的 total=300s 会在「网速 × 300s」处切断仍在正常传输的下载，重试又从
+    0 字节开始，用户看到的就是反复断在同一进度。这里把那个常量压到 0.3s，
+    让一个声明了长度的响应体花约 0.8s 慢慢传完。
+    """
+    monkeypatch.setattr("storage.file_manager._DOWNLOAD_TOTAL_TIMEOUT_S", 0.3)
+    chunk = b"\0" * 1024
+    chunks = 8
+
+    async def slow_body(request):
+        response = web.StreamResponse(headers={"Content-Length": str(len(chunk) * chunks)})
+        await response.prepare(request)
+        for _ in range(chunks):
+            await response.write(chunk)
+            await asyncio.sleep(0.1)
+        return response
+
+    save_path = tmp_path / "v.mp4"
+    async with _local_server(slow_body) as server, aiohttp.ClientSession() as session:
+        result = await FileManager(str(tmp_path)).download_file(
+            str(server.make_url("/v.mp4")), save_path, session=session
+        )
+
+    assert result is True
+    assert save_path.stat().st_size == len(chunk) * chunks
+
+
+@pytest.mark.asyncio
+async def test_download_file_gives_up_when_server_never_answers(tmp_path, monkeypatch):
+    """去掉总时长后，对端一直不回响应头也要被读间隙上限兜住，不能无限挂起。"""
+    monkeypatch.setattr("storage.file_manager._DOWNLOAD_READ_STALL_TIMEOUT_S", 0.3)
+    release = asyncio.Event()
+
+    async def never_answers(request):
+        await release.wait()
+        return web.Response(body=b"late")
+
+    save_path = tmp_path / "v.mp4"
+    async with _local_server(never_answers) as server, aiohttp.ClientSession() as session:
+        try:
+            result = await asyncio.wait_for(
+                FileManager(str(tmp_path)).download_file(
+                    str(server.make_url("/v.mp4")), save_path, session=session
+                ),
+                timeout=5,
+            )
+        finally:
+            release.set()
+
+    assert result is False
+    assert not save_path.exists()
 
 
 @pytest.mark.asyncio
@@ -500,50 +761,3 @@ async def test_download_file_rejects_incomplete_partial_content_206(tmp_path):
 
     assert ok is False
     assert not target.exists()
-
-
-def _aiohttp_session_returning_status(status):
-    """Build a mock aiohttp session whose ``get`` yields a response with the
-    given HTTP status (and no body — the non-200 path never reads content)."""
-    mock_response = AsyncMock()
-    mock_response.status = status
-
-    ctx = AsyncMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_response)
-    ctx.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session = MagicMock()
-    mock_session.get.return_value = ctx
-    return mock_session
-
-
-class _FakeHttpxResponse:
-    def __init__(self, status_code, content, headers):
-        self.status_code = status_code
-        self._content = content
-        self.headers = headers
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    async def aiter_bytes(self):
-        yield self._content
-
-
-class _FakeHttpxClient:
-    def __init__(self, response, calls):
-        self._response = response
-        self._calls = calls
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    def stream(self, method, url, headers=None):
-        self._calls.append((method, url, headers))
-        return self._response

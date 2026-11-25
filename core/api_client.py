@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 import aiohttp
 
 from auth import MsTokenManager
+from core.live_streams import flight_text_rows, inline_stream_data
 from utils.cookie_utils import sanitize_cookies
 from utils.logger import safe_log_url, setup_logger
 from utils.xbogus import XBogus
@@ -28,8 +29,119 @@ except Exception:  # pragma: no cover - optional dependency
 logger = setup_logger("APIClient")
 
 _LOGIN_REQUIRED_STATUS_CODES = {2483}
+
+# Douyin fronts the web API with an edge WAF that answers 403 (and 429)
+# once a caller trips a rate-based risk-control rule. Both are transient:
+# the block is served in tens of milliseconds without reaching the
+# backend, and the *same* cookies succeed again after a cooldown. A real
+# logout never looks like this — Douyin reports those as HTTP 200 with a
+# non-zero ``status_code`` (see ``_is_login_required``), so retrying a
+# 403 cannot mask an expired session.
+#
+# These reuse the ordinary retry schedule on purpose. A longer WAF-specific
+# backoff was tried and reverted: ``_request_json`` is the chokepoint for
+# every Douyin call, so stretching it to ~20s per request blew past the
+# renderer's 15s timeout on the my-content routes and turned per-item loops
+# (``user_downloader``'s detail recovery) into multi-hour stalls. Callers
+# that walk many pages degrade gracefully on an exhausted fetch instead.
+_RISK_CONTROL_HTTP_STATUSES = frozenset({403, 429})
+
+# 每次尝试之间的退避秒数（第 N 次失败后等 delays[N-1]）。aiohttp 与 page
+# bridge 两条路共用同一档预算，理由见上面那段注释。
+_RETRY_DELAYS_SECONDS = (1, 2, 5)
+_MAX_ATTEMPTS = 3
+_SERVER_ERROR_MIN_STATUS = 500
+
+# 上面说的限速 403 body 是空的或无关文本;Argus 门禁的 403 body 形如
+# ``Blocked by ArgusSecurityPlugin Uifid Not Found``——请求形状被确定性拒绝,重试 /
+# 等待 / 重新登录都无效(docs/spec/common-mistakes.md「Argus 门禁」)。
+ARGUS_REJECTION_MARKER = "ArgusSecurityPlugin"
+_ARGUS_REJECTION_STATUS = 403
+# 失败响应 body 只取前 80 字进日志:够看出 Uifid / Signature / Sign Invalid 三种提示。
+_ERROR_BODY_LOG_CHARS = 80
+# 读错误 body 的上限:只为诊断,慢速 / 不结束的 body 不能把请求拖到 30s 超时。
+_ERROR_BODY_READ_BYTES = 1024
+_ERROR_BODY_READ_TIMEOUT_SECONDS = 2.0
+
+# 作者主页「合集」的 series/list 分支:整份列表在 get_user_mix 的第一页里取完,
+# 页数上限兜住 has_more 恒为 1 的异常响应(每页 20 条 => 最多 200 个合集)。
+_SERIES_LIST_MAX_PAGES = 10
+
 _HOMEPAGE_SCREENSHOT_BRIDGE_ENV = "DOUYIN_HOMEPAGE_SCREENSHOT_BRIDGE"
 _HOMEPAGE_SCREENSHOT_MESSAGE_PREFIX = "DOUYIN_HOMEPAGE_SCREENSHOT_REQUEST "
+_HOMEPAGE_PROFILE_READY_SCRIPT = r"""(expected) => {
+    const normalize = (value) => String(value ?? "")
+        .normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+    const readyKey = "__DOUYIN_HOMEPAGE_PROFILE_READY_STATE__";
+    const blockedKey = "__DOUYIN_HOMEPAGE_PROFILE_BLOCKED_REASON__";
+    const reset = () => {
+        delete window[readyKey];
+        return false;
+    };
+    if (document.readyState !== "complete" || !document.body) return reset();
+
+    const bodyText = normalize(document.body.innerText || document.body.textContent);
+    const blocked = ["验证码", "安全验证", "验证后继续", "页面不存在", "用户不存在",
+        "账号已注销"].find((marker) => bodyText.includes(normalize(marker)));
+    if (blocked) {
+        window[blockedKey] = blocked;
+        return reset();
+    }
+    delete window[blockedKey];
+
+    const visible = (element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" &&
+            style.opacity !== "0" && rect.width > 0 && rect.height > 0 &&
+            rect.bottom > 0 && rect.top < Math.max(window.innerHeight || 0, 900);
+    };
+    const numberToken = "(\\d+(?:[.,]\\d+)?(?:万|亿|w|k|m)?\\+?)";
+    const groups = [["关注"], ["粉丝"], ["获赞", "点赞"]];
+    const readStats = (text, direction) => groups.map((labels) => {
+        for (const label of labels) {
+            const normalizedLabel = normalize(label);
+            const pattern = direction === "before"
+                ? new RegExp(`${numberToken}${normalizedLabel}`)
+                : new RegExp(`${normalizedLabel}${numberToken}`);
+            const match = text.match(pattern);
+            if (match?.[1]) return match[1];
+        }
+        return "";
+    });
+    const expectedNickname = normalize(expected?.nickname);
+    const candidates = Array.from(
+        document.body.querySelectorAll("main, header, section, article, div")
+    ).filter(visible).map((element) => {
+        const text = normalize(element.innerText || element.textContent);
+        if (!text || text.length > 1500) return null;
+        const before = readStats(text, "before");
+        const after = readStats(text, "after");
+        const beforeCount = before.filter(Boolean).length;
+        const afterCount = after.filter(Boolean).length;
+        const values = afterCount >= beforeCount ? after : before;
+        if (!values[1] || Math.max(beforeCount, afterCount) < 2) return null;
+        if (expectedNickname && !text.includes(expectedNickname)) return null;
+        return {element, text, values};
+    }).filter(Boolean).sort((left, right) => left.text.length - right.text.length);
+    const profile = candidates[0];
+    if (!profile) return reset();
+    const images = Array.from(document.images).filter(visible);
+    if (images.some((image) => !image.complete)) return reset();
+    if (document.fonts && document.fonts.status !== "loaded") return reset();
+
+    const loaded = images.filter((image) => image.naturalWidth > 0).length;
+    const signature = profile.values.concat(String(loaded)).join("|");
+    const previous = window[readyKey];
+    const count = previous?.signature === signature ? previous.count + 1 : 1;
+    window[readyKey] = {signature, count};
+    return count >= 3;
+}"""
+_HOMEPAGE_PROFILE_BLOCKED_SCRIPT = (
+    "() => String(window.__DOUYIN_HOMEPAGE_PROFILE_BLOCKED_REASON__ || '')"
+)
+# 就绪判定要等到懒加载的作品网格铺完，冷缓存下 20 秒常常不够。
+_HOMEPAGE_PROFILE_READY_TIMEOUT_MS = 45_000
 
 
 class LoginRequiredError(Exception):
@@ -43,9 +155,31 @@ class LoginRequiredError(Exception):
         self.status_code = status_code
         self.status_msg = status_msg
         self.path = path
-        super().__init__(
-            f"login required (status_code={status_code}) at {path}: {status_msg}"
-        )
+        super().__init__(f"login required (status_code={status_code}) at {path}: {status_msg}")
+
+
+class FailedPayload(dict):
+    """请求失败时回的空 payload,多带一条机器可读的失败原因。
+
+    与 ``{}`` 完全等价(``not payload``、``payload == {}`` 都成立):「失败回 ``{}``」
+    是几十个调用方与测试替身共同依赖的契约,不能换返回类型。只有分页 walk 读
+    ``kind``,据此决定要不要整页重试、给用户什么文案。拷贝(``dict(p)`` / ``{**p}``)
+    会丢掉原因,退化成普通的请求失败——只少了提示,不会误判。
+    """
+
+    # 抖音确定性拒绝:403 且 body 带 ArgusSecurityPlugin(直连或经 page bridge)。
+    REJECTED = "rejected"
+    # page bridge 传输失败(TIMEOUT / PAGE_LOAD_FAILED 等),``detail`` 是错误码。
+    BRIDGE_ERROR = "bridge_error"
+
+    def __init__(
+        self, kind: str, *, status: int = 0, detail: str = "", via_bridge: bool = False
+    ) -> None:
+        super().__init__()
+        self.kind = kind
+        self.status = status
+        self.detail = detail
+        self.via_bridge = via_bridge
 
 
 def _is_login_required(data: object) -> bool:
@@ -57,11 +191,7 @@ def _is_login_required(data: object) -> bool:
     # Douyin error code, but "用户未登录" is unambiguously "not logged in"
     # (returned by /profile/self/ and other endpoints on an expired
     # session). Message-matching avoids misreading an unrelated code-8.
-    return (
-        code in _LOGIN_REQUIRED_STATUS_CODES
-        or "请先登录" in msg
-        or "用户未登录" in msg
-    )
+    return code in _LOGIN_REQUIRED_STATUS_CODES or "请先登录" in msg or "用户未登录" in msg
 
 
 def _summarize_api_response(data: object) -> Dict[str, Any]:
@@ -69,12 +199,32 @@ def _summarize_api_response(data: object) -> Dict[str, Any]:
 
     raw = data if isinstance(data, dict) else {}
     item_key = "-"
-    item_count = 0
-    for key in ("aweme_list", "items", "followings", "mix_list", "music_list", "data"):
-        value = raw.get(key)
+    item_count: Any = 0
+    # 覆盖所有 ``_normalize_paged_response`` 用到的列表键：少一个就会把「列表里
+    # 有 3 条」记成 item_count=0，2026-09-16 的合集排查就因此多绕了一圈。
+    for key in (
+        "aweme_list",
+        "items",
+        "followings",
+        "mix_infos",
+        "mix_list",
+        "series_infos",
+        "music_list",
+        "collects_list",
+        "comments",
+        "data",
+    ):
+        if key not in raw:
+            continue
+        value = raw[key]
         if isinstance(value, list):
             item_key = key
             item_count = len(value)
+            break
+        if value is None:
+            # ``"mix_infos": null`` 与 ``[]`` 在日志里必须能分辨。
+            item_key = key
+            item_count = "null"
             break
 
     status_msg = " ".join(str(raw.get("status_msg") or "").split())[:200]
@@ -104,6 +254,56 @@ def _safe_error_text(exc: Exception) -> str:
     text = " ".join(str(exc).split())
     text = re.sub(r"(https?://[^?\s]+)\?\S+", r"\1?[redacted-query]", text)
     return text[:500]
+
+
+async def _read_error_body_prefix(response: Any) -> str:
+    """非 200 响应 body 的前 80 字,只用于日志与 Argus 判定;读失败不影响重试流程。
+
+    有界读取(字节数 + 时长):超时 / 断流时保留已经收到的部分,别让慢速 body
+    把请求挂到超时,也别因此丢掉已到手的 Argus 标记。
+    不用 ``asyncio.wait_for``:Python 3.9–3.11 上「读完」与外部取消同时发生时它会
+    吞掉取消(CPython gh-86296),CLI 仍支持这些版本。
+    """
+    received = bytearray()
+
+    async def _read_bounded() -> None:
+        while len(received) < _ERROR_BODY_READ_BYTES:
+            chunk = await response.content.read(_ERROR_BODY_READ_BYTES - len(received))
+            if not chunk:
+                return
+            received.extend(chunk)
+
+    reader = asyncio.ensure_future(_read_bounded())
+    reader.add_done_callback(_consume_task_exception)
+    try:
+        await asyncio.wait({reader}, timeout=_ERROR_BODY_READ_TIMEOUT_SECONDS)
+    finally:
+        reader.cancel()
+    return bytes(received).decode("utf-8", "replace")[:_ERROR_BODY_LOG_CHARS]
+
+
+def _consume_task_exception(task: "asyncio.Future[Any]") -> None:
+    """读流异常(断流等)只意味着少了诊断信息;取走它,免得 asyncio 报 never retrieved。"""
+    if not task.cancelled():
+        task.exception()
+
+
+def page_request_failed(page: Any) -> bool:
+    """归一化分页里「这一页请求没成功」的判据。
+
+    与 ``core.user_modes.base_strategy._empty_page_failure_cause`` 同源，但**不含**
+    ``items_missing``:``mix_infos`` / ``series_infos`` 为 ``null`` 是「这个作者没有
+    合集」的正常形态(2026-09-16 实测),把它当失败会让普通作者全都扫成失败。
+    """
+    if not isinstance(page, dict):
+        return False
+    if "raw" in page and not page.get("raw"):
+        return True
+    return bool(page.get("status_code"))
+
+
+def _is_argus_rejection(status: int, body_prefix: str) -> bool:
+    return status == _ARGUS_REJECTION_STATUS and ARGUS_REJECTION_MARKER in body_prefix
 
 
 def _log_api_response(
@@ -150,6 +350,8 @@ _USER_AGENT_POOL = [
 
 class DouyinAPIClient:
     BASE_URL = "https://www.douyin.com"
+    LIVE_WEB_BASE_URL = "https://live.douyin.com"
+    LIVE_REFLOW_BASE_URL = "https://webcast.amemv.com"
     _BROWSER_COOKIE_BLOCKLIST = {
         "sessionid",
         "sessionid_ss",
@@ -165,9 +367,19 @@ class DouyinAPIClient:
         "login_time",
     }
 
-    def __init__(self, cookies: Dict[str, str], proxy: Optional[str] = None):
+    def __init__(
+        self,
+        cookies: Dict[str, str],
+        proxy: Optional[str] = None,
+        page_bridge: Optional[Any] = None,
+    ):
         self.cookies = sanitize_cookies(cookies or {})
         self.proxy = str(proxy or "").strip()
+        # 桌面版注入的页面签名通道(core/page_bridge.py,desktop-only)。为 None 时
+        # 所有端点走 aiohttp——CLI 姊妹仓永远是 None。鸭子类型:只要求
+        # ``await fetch(path, params, method=, data=)`` 返回带 http_status/body/text
+        # 的对象,失败异常带 ``page_bridge_code``。
+        self.page_bridge = page_bridge
         self._session: Optional[aiohttp.ClientSession] = None
         self._browser_post_aweme_items: Dict[str, Dict[str, Any]] = {}
         self._browser_post_stats: Dict[str, int] = {}
@@ -305,7 +517,7 @@ class DouyinAPIClient:
         params: Dict[str, Any],
         *,
         suppress_error: bool = False,
-        max_retries: int = 3,
+        max_retries: int = _MAX_ATTEMPTS,
         base_url: Optional[str] = None,
         request_headers: Optional[Dict[str, str]] = None,
         method: str = "GET",
@@ -315,11 +527,13 @@ class DouyinAPIClient:
         method = method.upper()
         if method not in {"GET", "POST"}:
             raise ValueError(f"unsupported request method: {method}")
-        delays = [1, 2, 5]
+        delays = _RETRY_DELAYS_SECONDS
         last_exc: Optional[Exception] = None
+        risk_control_hit = False
 
         for attempt in range(max_retries):
             started = time.monotonic()
+            risk_control_hit = False
             signing_kwargs: Dict[str, Any] = {}
             if base_url:
                 signing_kwargs["base_url"] = base_url
@@ -354,12 +568,17 @@ class DouyinAPIClient:
                         if not body:
                             # Empty 200 response is a common anti-bot signal
                             # from Douyin. Retry with a fresh signature.
+                            retry_status = (
+                                "will retry" if attempt < max_retries - 1 else "no retries remain"
+                            )
                             logger.warning(
-                                "Empty 200 response for %s (attempt %d/%d), "
-                                "likely anti-bot; will retry",
+                                "Empty 200 response for %s (attempt %d/%d, duration_ms=%d), "
+                                "likely anti-bot; %s",
                                 path,
                                 attempt + 1,
                                 max_retries,
+                                _elapsed_ms(started),
+                                retry_status,
                             )
                             last_exc = RuntimeError(f"Empty 200 response for {path} (anti-bot)")
                             if attempt < max_retries - 1:
@@ -390,23 +609,42 @@ class DouyinAPIClient:
                                 path,
                             )
                         return result
-                    if response.status < 500 and response.status != 429:
+                    body_prefix = await _read_error_body_prefix(response)
+                    risk_control_hit = response.status in _RISK_CONTROL_HTTP_STATUSES
+                    terminal = _is_argus_rejection(response.status, body_prefix) or (
+                        response.status < 500 and not risk_control_hit
+                    )
+                    if terminal:
                         log_fn = logger.info if suppress_error else logger.error
                         log_fn(
                             "Douyin API HTTP failure: path=%s attempt=%d/%d status=%s "
-                            "duration_ms=%d suppress_error=%s",
+                            "duration_ms=%d suppress_error=%s body=%r",
                             path,
                             attempt + 1,
                             max_retries,
                             response.status,
                             _elapsed_ms(started),
                             suppress_error,
+                            body_prefix,
                         )
-                        return {}
+                        if not _is_argus_rejection(response.status, body_prefix):
+                            return {}
+                        return FailedPayload(
+                            FailedPayload.REJECTED, status=response.status, detail=body_prefix
+                        )
                     last_exc = RuntimeError(f"HTTP {response.status} for {path}")
+                    logger.warning(
+                        "Douyin API retryable HTTP failure: path=%s attempt=%d/%d status=%s "
+                        "duration_ms=%d risk_control=%s body=%r",
+                        path,
+                        attempt + 1,
+                        max_retries,
+                        response.status,
+                        _elapsed_ms(started),
+                        risk_control_hit,
+                        body_prefix,
+                    )
             except LoginRequiredError:
-                # Never swallow the login signal into the retry loop — the
-                # caller must see it to trigger a re-login flow.
                 raise
             except Exception as exc:
                 last_exc = exc
@@ -424,11 +662,13 @@ class DouyinAPIClient:
             if attempt < max_retries - 1:
                 delay = delays[min(attempt, len(delays) - 1)]
                 logger.info(
-                    "Douyin API retry scheduled: path=%s completed_attempt=%d/%d delay_s=%d",
+                    "Douyin API retry scheduled: path=%s completed_attempt=%d/%d "
+                    "delay_s=%d risk_control=%s",
                     path,
                     attempt + 1,
                     max_retries,
                     delay,
+                    risk_control_hit,
                 )
                 await asyncio.sleep(delay)
 
@@ -444,6 +684,137 @@ class DouyinAPIClient:
         )
         return {}
 
+    def _payload_from_bridge_result(self, result: Any, path: str, started: float) -> Dict[str, Any]:
+        """把 bridge 200 响应折算成与 ``_request_json`` 一致的 payload。
+
+        body 非 dict(如反爬 HTML challenge 页)按 Non-JSON 200 记警告并降级为
+        ``{}``,与 aiohttp 路径的同名日志对齐,避免把它悄悄记成成功响应。
+        """
+        text = str(getattr(result, "text", "") or "")
+        body = getattr(result, "body", None)
+        if not isinstance(body, dict):
+            logger.warning(
+                "Non-JSON 200 response via page bridge: path=%s text_len=%d",
+                path,
+                len(text),
+            )
+        payload = body if isinstance(body, dict) else {}
+        _log_api_response(path, 0, 1, text.encode("utf-8", "replace"), payload, started)
+        if _is_login_required(payload):
+            raise LoginRequiredError(
+                int(payload.get("status_code") or 0),
+                str(payload.get("status_msg") or ""),
+                path,
+            )
+        return payload
+
+    async def _request_json_gated(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        method: str = "GET",
+        data: Optional[Dict[str, Any]] = None,
+        request_headers: Optional[Dict[str, str]] = None,
+        suppress_error: bool = False,
+    ) -> Dict[str, Any]:
+        """被 ArgusSecurityPlugin 门禁的端点入口。
+
+        有 ``page_bridge`` 时交给 Electron 隐藏登录窗口发(页面 SDK 补
+        uifid / timestamp / x-secsdk-web-signature),否则与 ``_request_json``
+        完全一致。经 bridge 的 403/429 不重试:Argus 拒绝是确定性的,重试只会
+        加速触发验证码。5xx 与反爬空 200 是瞬时的,与 aiohttp 路径同档重试。
+        """
+        if self.page_bridge is None:
+            return await self._request_json(
+                path,
+                params,
+                method=method,
+                data=data,
+                request_headers=request_headers,
+                suppress_error=suppress_error,
+            )
+        started = time.monotonic()
+        logger.info(
+            "Douyin API request via page bridge: path=%s method=%s param_keys=%s",
+            path,
+            method.upper(),
+            ",".join(sorted(str(key) for key in params)),
+        )
+        for attempt in range(_MAX_ATTEMPTS):
+            result = await self._fetch_via_page_bridge(path, params, method=method, data=data)
+            status = int(getattr(result, "http_status", 0) or 0)
+            if not self._bridge_answer_is_transient(result, status):
+                break
+            logger.warning(
+                "Douyin API transient failure via page bridge: path=%s attempt=%d/%d status=%s",
+                path,
+                attempt + 1,
+                _MAX_ATTEMPTS,
+                status,
+            )
+            if attempt == _MAX_ATTEMPTS - 1:
+                break
+            await asyncio.sleep(_RETRY_DELAYS_SECONDS[min(attempt, len(_RETRY_DELAYS_SECONDS) - 1)])
+        if status == 200:
+            return self._payload_from_bridge_result(result, path, started)
+        body_prefix = str(getattr(result, "text", "") or "")[:_ERROR_BODY_LOG_CHARS]
+        log_fn = logger.info if suppress_error else logger.error
+        log_fn(
+            "Douyin API HTTP failure via page bridge: path=%s status=%s duration_ms=%d body=%r",
+            path,
+            status,
+            _elapsed_ms(started),
+            body_prefix,
+        )
+        # 与直连同一判据:只有 Argus 标记是确定性拒绝;普通 403 / 429 可能只是限流,
+        # 分页 walk 仍要有整页重试的机会。
+        if not _is_argus_rejection(status, body_prefix):
+            return {}
+        return FailedPayload(
+            FailedPayload.REJECTED, status=status, detail=body_prefix, via_bridge=True
+        )
+
+    async def _fetch_via_page_bridge(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        method: str,
+        data: Optional[Dict[str, Any]],
+    ) -> Any:
+        try:
+            return await self.page_bridge.fetch(path, params, method=method.upper(), data=data)
+        except Exception as exc:
+            if getattr(exc, "page_bridge_code", None) == "NOT_LOGGED_IN":
+                raise LoginRequiredError(0, "page bridge: not logged in", path) from exc
+            raise
+
+    @staticmethod
+    def _bridge_answer_is_transient(result: Any, status: int) -> bool:
+        """只有服务端 5xx 与「空 200」值得重试。
+
+        403/429 是 Argus 的确定性拒绝;其余 4xx 同样不会自愈;非空但非 JSON
+        的 200 是验证码/挑战页,重试只是白烧这个窗口。
+        """
+        if status >= _SERVER_ERROR_MIN_STATUS:
+            return True
+        if status != 200 or isinstance(getattr(result, "body", None), dict):
+            return False
+        return not str(getattr(result, "text", "") or "").strip()
+
+    @classmethod
+    def _unavailable_paged_response(cls, *, item_keys: List[str]) -> Dict[str, Any]:
+        """「这个端点对当前参数不适用」而不是「请求失败」。
+
+        故意给一个非空 ``raw``：调用方靠空 ``raw`` 判定请求失败
+        (见 ``BaseUserModeStrategy._page_request_failed``)，这里直接返回
+        空列表却带着空 ``raw`` 会被误报成限流。
+        """
+        return cls._normalize_paged_response(
+            {"status_code": 0, "has_more": 0}, item_keys=item_keys, source="api"
+        )
+
     @staticmethod
     def _normalize_paged_response(
         raw_data: Any,
@@ -456,11 +827,19 @@ class DouyinAPIClient:
         keys = ["items", *keys, "aweme_list", "mix_list", "music_list"]
 
         items: List[Dict[str, Any]] = []
+        # 显式的 ``"aweme_list": null`` 与真 ``[]`` 归一化后都是空 items，但只有
+        # 后者可信：docs/spec/gotchas.md 记着 0.11.2 把 null 当空收藏夹，清空了
+        # 用户的自定义收藏夹。这里留下痕迹，让分页走查能判成失败而不是到底。
+        items_missing = False
         for key in keys:
-            value = raw.get(key)
+            if key not in raw:
+                continue
+            value = raw[key]
             if isinstance(value, list):
                 items = value
+                items_missing = False
                 break
+            items_missing = True
 
         has_more_value = raw.get("has_more", False)
         try:
@@ -493,6 +872,7 @@ class DouyinAPIClient:
 
         normalized = {
             "items": items,
+            "items_missing": items_missing,
             "aweme_list": items,  # 兼容旧调用方
             "has_more": has_more,
             "max_cursor": max_cursor,
@@ -536,7 +916,7 @@ class DouyinAPIClient:
                 }
             )
 
-            data = await self._request_json(
+            data = await self._request_json_gated(
                 "/aweme/v1/web/aweme/detail/",
                 params,
                 suppress_error=(suppress_error or aid != self._DETAIL_AID_CANDIDATES[-1]),
@@ -579,28 +959,191 @@ class DouyinAPIClient:
                 "publish_video_strategy_type": "2",
             }
         )
-        raw = await self._request_json("/aweme/v1/web/aweme/post/", params)
-        return self._normalize_paged_response(raw, item_keys=["aweme_list"])
+        raw = await self._request_json_gated("/aweme/v1/web/aweme/post/", params)
+        return self._normalize_post_page(raw, max_cursor=max_cursor)
+
+    @classmethod
+    def _normalize_post_page(cls, raw: Any, *, max_cursor: int) -> Dict[str, Any]:
+        """作品列表页归一化,另把「游客拿不到的后续页」标成 ``pagination_missing``。
+
+        2026-10 F2 #435 与 Douyin_TikTok_Download_API 分别实测:登录态每页都带
+        ``has_more``(到底时为 0);游客身份第一页之后的任何游标只回 17 字节的
+        ``{"status_code":0}``,没有列表也没有 ``has_more``,和「翻到底」长得一样。
+        不标出来,主页只下到第一页却报成功,订阅还会把水位推过没扫到的积压。
+        只认非零游标:游客第一页照常有数据,第一页回这个形态没实测过,不归这一类。
+        只认这个端点:别的端点同形响应的含义没实测过,mix/list 一旦软中断,
+        ``UserDownloader`` 会把 post 整段跳过。
+        """
+        page = cls._normalize_paged_response(raw, item_keys=["aweme_list"])
+        page["pagination_missing"] = bool(
+            max_cursor
+            and isinstance(raw, dict)
+            and raw
+            and page["status_code"] == 0
+            and "aweme_list" not in raw
+            and "has_more" not in raw
+        )
+        return page
 
     async def get_user_like(
         self, sec_uid: str, max_cursor: int = 0, count: int = 20
     ) -> Dict[str, Any]:
         params = await self._build_user_page_params(sec_uid, max_cursor, count)
-        raw = await self._request_json("/aweme/v1/web/aweme/favorite/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/aweme/favorite/", params)
         return self._normalize_paged_response(raw, item_keys=["aweme_list"])
 
     async def get_user_mix(
         self, sec_uid: str, max_cursor: int = 0, count: int = 20
     ) -> Dict[str, Any]:
+        """作者主页「合集」= ``mix/list`` ∪ ``series/list``。
+
+        2026-09-16 实测:两个端点的结果互不相交,谁都不是谁的超集——橙子说漫
+        ``mix_infos=null`` / ``series_infos=3``,煎饼果仔 ``mix_infos=1`` /
+        ``series_infos=2``,普通作者两边都空。只查 ``mix/list`` 的作者会被判成
+        「没有公开合集」。两边的 id 同一套:``mix/detail`` 与 ``mix/aweme`` 拿
+        ``series_id`` 都能正常返回,所以 series 条目在这里就整形成 mix 形态,
+        下游(合集扫描、mix 下载模式)不必知道有第二个来源。
+        ``series/list`` 整份在第一次调用里走完:翻页游标属于 ``mix/list``,
+        两边混用会重复拉取。
+
+        一边失败一边有内容时交出拿到的部分(CLI 没有 page bridge,``mix/list``
+        必然被 Argus 拒,只让 series 那半边成立总比整个模式失败好);两边都
+        没内容时必须把失败页交出去,否则「请求失败」又会被显示成「没有公开
+        合集」——那正是这次要修的谎。
+        """
         params = await self._build_user_page_params(sec_uid, max_cursor, count)
-        raw = await self._request_json("/aweme/v1/web/mix/list/", params)
-        return self._normalize_paged_response(raw, item_keys=["mix_infos", "mix_list"])
+        raw = await self._request_json_gated("/aweme/v1/web/mix/list/", params)
+        page = self._normalize_paged_response(raw, item_keys=["mix_infos", "mix_list"])
+        if (
+            not page_request_failed(page)
+            and not page.get("has_more")
+            and raw.get("mix_infos", raw.get("mix_list", [])) is None
+        ):
+            # 正常 null = 没有公开合集；不能让 post+mix 把全部作品当未知归属跳过。
+            page["items_missing"] = False
+        if page_request_failed(page):
+            page["incomplete_reason"] = "部分合集请求失败，合集列表不完整"
+        if max_cursor:
+            return page
+        try:
+            series_items, series_failure = await self._collect_user_series_as_mixes(sec_uid, count)
+        except Exception:
+            if not page.get("items"):
+                raise
+            logger.warning("series/list failed, keeping mix/list page only", exc_info=True)
+            page["incomplete_reason"] = "部分合集请求失败，合集列表不完整"
+            return page
+        if series_failure is not None:
+            page["incomplete_reason"] = (
+                series_failure.get("incomplete_reason") or "部分合集请求失败，合集列表不完整"
+            )
+        if series_failure is not None and not series_items and not page.get("items"):
+            return series_failure
+        return self._merge_series_into_page(page, series_items)
+
+    async def get_user_series(
+        self, sec_uid: str, cursor: int = 0, count: int = 20
+    ) -> Dict[str, Any]:
+        """作者主页「合集」里的 new mix(series)一页。
+
+        参数照抄网页:``read_new_mix=true`` 是必需的——去掉它抖音恒回
+        ``series_infos=null``(2026-09-16 实测)。游标字段是 ``cursor`` 而不是
+        ``max_cursor``,值是时间戳形态的下一页锚点,必须原样回传。
+        """
+        params = await self._default_query()
+        params.update(
+            {
+                "sec_user_id": sec_uid,
+                "req_from": "channel_pc_web",
+                "read_new_mix": "true",
+                "cursor": cursor,
+                "count": count,
+            }
+        )
+        raw = await self._request_json_gated("/aweme/v1/web/series/list/", params)
+        return self._normalize_paged_response(raw, item_keys=["series_infos"])
+
+    async def _collect_user_series_as_mixes(
+        self, sec_uid: str, count: int
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """走完 series/list;第二个返回值是失败页(没失败就是 None)。
+
+        这里的失败绝大多数不是异常:``_request_json`` 的 HTTP 错误、bridge 的
+        非 Argus 非 200 都回空 ``{}``,Argus 403 回假值 ``FailedPayload``。
+        只 catch 异常会把它们当成「这个作者没有 series 合集」,正是本次要修的
+        那个谎。所以逐页按 raw / status_code 判失败,交给调用方定策略。
+        """
+        items: List[Dict[str, Any]] = []
+        cursor = 0
+        for _ in range(_SERIES_LIST_MAX_PAGES):
+            page = await self.get_user_series(sec_uid, cursor=cursor, count=count)
+            page_items = page.get("items") or []
+            items.extend(
+                self._series_entry_as_mix(entry)
+                for entry in page_items
+                if isinstance(entry, dict) and entry.get("series_id")
+            )
+            if not page_items and page_request_failed(page):
+                logger.warning("series/list page failed at cursor=%s", cursor)
+                return items, page
+            if not page.get("has_more"):
+                return items, None
+            # 游标取原始 ``cursor``:series/list 没有 ``max_cursor``,但归一化层
+            # 优先读它,真出现 ``max_cursor: 0`` 会把翻页判成「游标没推进」。
+            next_cursor = int(page.get("cursor") or page.get("max_cursor") or 0)
+            if next_cursor == cursor:
+                logger.warning("Series list cursor did not advance (%s), stopping", cursor)
+                page["incomplete_reason"] = "合集列表分页游标未推进，列表不完整"
+                return items, page
+            cursor = next_cursor
+        logger.warning(
+            "Series list hit the %d-page cap for %s, later pages dropped",
+            _SERIES_LIST_MAX_PAGES,
+            sec_uid,
+        )
+        page["incomplete_reason"] = "合集列表达到扫描上限，列表不完整"
+        return items, page
+
+    @staticmethod
+    def _series_entry_as_mix(entry: Dict[str, Any]) -> Dict[str, Any]:
+        """series_infos 条目 -> mix_infos 形态,只搬下游真正读到的字段。"""
+        return {
+            "mix_id": str(entry.get("series_id") or ""),
+            "mix_name": entry.get("series_name") or "",
+            "statis": entry.get("stats") or {},
+            "author": entry.get("author") or {},
+        }
+
+    @staticmethod
+    def _mix_entry_id(item: Any) -> str:
+        if not isinstance(item, dict):
+            return ""
+        meta = item.get("mix_info") if isinstance(item.get("mix_info"), dict) else item
+        return str(meta.get("mix_id") or "")
+
+    @classmethod
+    def _merge_series_into_page(
+        cls, page: Dict[str, Any], series_items: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        if not series_items:
+            return page
+        existing = {cls._mix_entry_id(item) for item in page.get("items") or []}
+        merged = list(page.get("items") or [])
+        merged.extend(item for item in series_items if item["mix_id"] not in existing)
+        if not page.get("raw"):
+            # mix/list 这一页失败了,但 series/list 有内容:交出拿到的部分,
+            # 别让一次失败把整份合集列表打成空。
+            logger.warning("mix/list page failed, returning %d series entries only", len(merged))
+        page["items"] = merged
+        page["aweme_list"] = merged
+        page["items_missing"] = False
+        return page
 
     async def get_user_music(
         self, sec_uid: str, max_cursor: int = 0, count: int = 20
     ) -> Dict[str, Any]:
         params = await self._build_user_page_params(sec_uid, max_cursor, count)
-        raw = await self._request_json("/aweme/v1/web/music/list/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/music/list/", params)
         return self._normalize_paged_response(raw, item_keys=["music_list"])
 
     async def get_following_page(
@@ -670,7 +1213,7 @@ class DouyinAPIClient:
         """
         if sec_uid and sec_uid != "self":
             logger.warning("Account collection currently requires self sec_uid, got=%s", sec_uid)
-            return self._normalize_paged_response({}, item_keys=["aweme_list"], source="api")
+            return self._unavailable_paged_response(item_keys=["aweme_list"])
 
         params = await self._default_query()
         params.update(
@@ -680,7 +1223,7 @@ class DouyinAPIClient:
                 "version_name": "17.4.0",
             }
         )
-        raw = await self._request_json(
+        raw = await self._request_json_gated(
             "/aweme/v1/web/aweme/listcollection/",
             params,
             method="POST",
@@ -697,10 +1240,10 @@ class DouyinAPIClient:
     ) -> Dict[str, Any]:
         if sec_uid and sec_uid != "self":
             logger.warning("Collect folders currently require self sec_uid, got=%s", sec_uid)
-            return self._normalize_paged_response({}, item_keys=["collects_list"], source="api")
+            return self._unavailable_paged_response(item_keys=["collects_list"])
 
         params = await self._build_collect_page_params(max_cursor, count)
-        raw = await self._request_json("/aweme/v1/web/collects/list/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/collects/list/", params)
         return self._normalize_paged_response(raw, item_keys=["collects_list"])
 
     async def get_collect_aweme(
@@ -708,7 +1251,7 @@ class DouyinAPIClient:
     ) -> Dict[str, Any]:
         params = await self._build_collect_page_params(max_cursor, count)
         params.update({"collects_id": collects_id})
-        raw = await self._request_json("/aweme/v1/web/collects/video/list/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/collects/video/list/", params)
         return self._normalize_paged_response(raw, item_keys=["aweme_list"])
 
     async def get_user_collect_mix(
@@ -716,10 +1259,10 @@ class DouyinAPIClient:
     ) -> Dict[str, Any]:
         if sec_uid and sec_uid != "self":
             logger.warning("Collect mix currently require self sec_uid, got=%s", sec_uid)
-            return self._normalize_paged_response({}, item_keys=["mix_infos"], source="api")
+            return self._unavailable_paged_response(item_keys=["mix_infos"])
 
         params = await self._build_collect_page_params(max_cursor, count)
-        raw = await self._request_json("/aweme/v1/web/mix/listcollection/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/mix/listcollection/", params)
         return self._normalize_paged_response(raw, item_keys=["mix_infos"])
 
     async def get_user_info(self, sec_uid: str) -> Optional[Dict[str, Any]]:
@@ -744,9 +1287,7 @@ class DouyinAPIClient:
         ``get_following_page``.
         """
         params = await self._default_query()
-        data = await self._request_json(
-            "/aweme/v1/web/user/profile/self/", params
-        )
+        data = await self._request_json("/aweme/v1/web/user/profile/self/", params)
         if data:
             return data.get("user")
         return None
@@ -754,21 +1295,25 @@ class DouyinAPIClient:
     async def get_mix_detail(self, mix_id: str) -> Optional[Dict[str, Any]]:
         params = await self._default_query()
         params.update({"mix_id": mix_id})
-        data = await self._request_json("/aweme/v1/web/mix/detail/", params)
+        data = await self._request_json_gated("/aweme/v1/web/mix/detail/", params)
         if not data:
             return None
         return data.get("mix_info") or data.get("mix_detail") or data
 
     async def get_mix_aweme(self, mix_id: str, cursor: int = 0, count: int = 20) -> Dict[str, Any]:
+        # 2026-09-10 起 ``mix/aweme/`` 也被 ArgusSecurityPlugin 门禁(aiohttp 恒
+        # 403 ``Uifid Not Found`` → 补 uifid 后 ``Signature Not Found``),与
+        # favorite / collects 同档。2026-09-14 起名单扩到 aweme/detail、
+        # aweme/post、mix/detail、mix/list、music/detail、music/aweme、music/list。
         params = await self._default_query()
         params.update({"mix_id": mix_id, "cursor": cursor, "count": count})
-        raw = await self._request_json("/aweme/v1/web/mix/aweme/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/mix/aweme/", params)
         return self._normalize_paged_response(raw, item_keys=["aweme_list"])
 
     async def get_music_detail(self, music_id: str) -> Optional[Dict[str, Any]]:
         params = await self._default_query()
         params.update({"music_id": music_id})
-        data = await self._request_json("/aweme/v1/web/music/detail/", params)
+        data = await self._request_json_gated("/aweme/v1/web/music/detail/", params)
         if not data:
             return None
         return data.get("music_info") or data.get("music_detail") or data
@@ -778,61 +1323,151 @@ class DouyinAPIClient:
     ) -> Dict[str, Any]:
         params = await self._default_query()
         params.update({"music_id": music_id, "cursor": cursor, "count": count})
-        raw = await self._request_json("/aweme/v1/web/music/aweme/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/music/aweme/", params)
         return self._normalize_paged_response(raw, item_keys=["aweme_list"])
 
-    async def get_live_room_info(
-        self, room_id: str, *, sec_user_id: str = ""
-    ) -> Optional[Dict[str, Any]]:
-        """通过房间号（web_rid）拉取直播间信息。
-
-        返回包含 room_info + stream_url 的 dict；若房间不在直播中或接口失败返回 None。
-        """
+    async def _build_live_room_request(
+        self, room_id: str, sec_user_id: str, room_id_kind: str
+    ) -> Tuple[str, Dict[str, Any], str]:
         params = await self._default_query()
+        if room_id_kind == "room_id":
+            params.update(
+                {
+                    "room_id": room_id,
+                    "sec_user_id": sec_user_id,
+                    "type_id": "0",
+                    "live_id": "1",
+                    "app_id": "1128",
+                    "version_code": "99.99.99",
+                }
+            )
+            return "/webcast/room/reflow/info/", params, self.LIVE_REFLOW_BASE_URL
+
         params.update(
             {
                 "web_rid": room_id,
-                "room_id_str": room_id,
+                "app_name": "douyin_web",
+                "live_id": "1",
+                "device_platform": "web",
+                "language": "zh-CN",
                 "enter_source": "",
                 "is_need_double_stream": "false",
                 "cookie_enabled": "true",
             }
         )
-        if sec_user_id:
-            params["sec_user_id"] = sec_user_id
+        return "/webcast/room/web/enter/", params, self.LIVE_WEB_BASE_URL
 
-        raw = await self._request_json(
-            "/webcast/room/web/enter/",
-            params,
-            suppress_error=True,
-        )
-        if not raw:
+    @staticmethod
+    def _normalize_live_room_response(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+        if not isinstance(data, dict):
             return None
 
-        data_section = raw.get("data") if isinstance(raw.get("data"), dict) else raw
-        if not isinstance(data_section, dict):
-            return None
-
-        room_list = data_section.get("data")
-        room = None
-        if isinstance(room_list, list) and room_list:
-            first = room_list[0]
-            if isinstance(first, dict):
-                room = first
-        elif isinstance(data_section.get("room"), dict):
-            room = data_section.get("room")
-        elif isinstance(raw.get("room"), dict):
+        room = data.get("room") if isinstance(data.get("room"), dict) else None
+        room_list = data.get("data")
+        if room is None and isinstance(room_list, list) and room_list:
+            room = room_list[0] if isinstance(room_list[0], dict) else None
+        if room is None and isinstance(raw.get("room"), dict):
             room = raw.get("room")
-
         if not isinstance(room, dict):
             return None
 
-        user = data_section.get("user") if isinstance(data_section, dict) else None
-        return {
-            "room": room,
-            "user": user if isinstance(user, dict) else {},
-            "raw": raw,
-        }
+        user = data.get("user") if isinstance(data.get("user"), dict) else room.get("owner")
+        return {"room": room, "user": user if isinstance(user, dict) else {}, "raw": raw}
+
+    @staticmethod
+    def _find_stream_room(value: Any, web_rid: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        # 真实页面的 web_rid 挂在 roomInfo 上（roomInfo.{web_rid, room}），只认直接父对象，避免推荐位房间误中。
+        pending: List[Tuple[Any, str]] = [(value, "")]
+        while pending:
+            current, parent_rid = pending.pop()
+            if isinstance(current, dict):
+                if isinstance(current.get("stream_url"), dict):
+                    owner = current.get("owner") if isinstance(current.get("owner"), dict) else {}
+                    identity = str(owner.get("web_rid") or current.get("web_rid") or parent_rid)
+                    if web_rid is None or identity == web_rid:
+                        return current
+                own_rid = str(current.get("web_rid") or "")
+                pending.extend((child, own_rid) for child in current.values())
+            elif isinstance(current, list):
+                pending.extend((child, "") for child in current)
+        return None
+
+    @staticmethod
+    def _extract_live_room_from_html(
+        html: str, web_rid: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        pattern = r"<script[^>]*>\s*(self\.__pace_f\.push\(.*?\))\s*</script>"
+        pushes = []
+        for call in re.findall(pattern, html, flags=re.DOTALL):
+            try:
+                args = json.loads(call[len("self.__pace_f.push(") : -1])
+            except ValueError:
+                continue
+            if isinstance(args, list) and len(args) > 1 and isinstance(args[1], str):
+                pushes.append((args[0], args[1]))
+        for _, flight in pushes:
+            if not re.match(r"^[0-9a-fA-F]+:", flight):
+                continue
+            try:
+                room = DouyinAPIClient._find_stream_room(
+                    json.loads(flight.split(":", 1)[1]), web_rid
+                )
+            except (IndexError, TypeError, ValueError):
+                continue
+            if room:
+                stream = "".join(text for kind, text in pushes if kind == 1)
+                inline_stream_data(room, flight_text_rows(stream))
+                user = room.get("owner") if isinstance(room.get("owner"), dict) else {}
+                return {"room": room, "user": user, "raw": {"source": "live_page_ssr"}}
+        return None
+
+    async def _fetch_live_room_from_page(self, web_rid: str) -> Optional[Dict[str, Any]]:
+        await self._ensure_session()
+        url = f"{self.LIVE_WEB_BASE_URL}/{web_rid}"
+        headers = {**self.headers, "Referer": "https://live.douyin.com/"}
+        try:
+            async with self._session.get(
+                url, headers=headers, proxy=self.proxy or None
+            ) as response:
+                if response.status != 200:
+                    logger.error(
+                        "Live page request failed: web_rid=%s, status=%s", web_rid, response.status
+                    )
+                    return None
+                return self._extract_live_room_from_html(await response.text(), web_rid)
+        except Exception as exc:
+            logger.error("Live page fallback failed: web_rid=%s, error=%s", web_rid, exc)
+            return None
+
+    async def get_live_room_info(
+        self,
+        room_id: str,
+        *,
+        sec_user_id: str = "",
+        room_id_kind: str = "web_rid",
+    ) -> Optional[Dict[str, Any]]:
+        """按网页直播号或内部 room ID 拉取统一的直播间信息。"""
+        path, params, base_url = await self._build_live_room_request(
+            room_id, sec_user_id, room_id_kind
+        )
+
+        raw = await self._request_json(
+            path,
+            params,
+            suppress_error=room_id_kind != "room_id",
+            max_retries=1 if room_id_kind != "room_id" else 3,
+            base_url=base_url,
+            request_headers={
+                "Referer": "https://live.douyin.com/",
+                "Origin": "https://live.douyin.com",
+            },
+        )
+        info = self._normalize_live_room_response(raw) if raw else None
+        if info or room_id_kind == "room_id":
+            return info
+        logger.info("Live API unavailable for web_rid=%s; trying page SSR", room_id)
+        return await self._fetch_live_room_from_page(room_id)
 
     async def get_live_replay_episode(self, episode_id: str) -> Optional[Dict[str, Any]]:
         """获取直播回放入口信息，包含回放对应的 room_id。"""
@@ -1134,13 +1769,14 @@ class DouyinAPIClient:
         sec_uid: str,
         save_path: Path,
         *,
+        profile: Optional[Dict[str, Any]] = None,
         viewport_width: int = 1600,
         viewport_height: int = 900,
         timeout_seconds: int = 30,
     ) -> bool:
         """Save one creator-homepage viewport without affecting downloads."""
         if os.environ.get(_HOMEPAGE_SCREENSHOT_BRIDGE_ENV) == "electron":
-            return self._emit_homepage_screenshot_request(sec_uid, save_path)
+            return self._emit_homepage_screenshot_request(sec_uid, save_path, profile)
 
         try:
             from playwright.async_api import async_playwright
@@ -1193,7 +1829,33 @@ class DouyinAPIClient:
                                 "Homepage screenshot skipped because verification is required"
                             )
                             return False
-                        await page.wait_for_timeout(1500)
+                        profile_expectation: Dict[str, str] = {}
+                        if isinstance(profile, dict):
+                            nickname = profile.get("nickname")
+                            if isinstance(nickname, str) and nickname.strip():
+                                profile_expectation["nickname"] = nickname.strip()[:200]
+                        try:
+                            await page.wait_for_function(
+                                _HOMEPAGE_PROFILE_READY_SCRIPT,
+                                arg=profile_expectation,
+                                polling=250,
+                                timeout=_HOMEPAGE_PROFILE_READY_TIMEOUT_MS,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Homepage profile data did not become ready before capture: %s",
+                                _safe_error_text(exc),
+                            )
+                        try:
+                            blocked_reason = await page.evaluate(_HOMEPAGE_PROFILE_BLOCKED_SCRIPT)
+                        except Exception:
+                            blocked_reason = ""
+                        if blocked_reason:
+                            logger.warning(
+                                "Homepage screenshot skipped because the page is blocked: %s",
+                                blocked_reason,
+                            )
+                            return False
                         await page.screenshot(path=str(tmp_path), type="png", full_page=False)
                         await asyncio.to_thread(os.replace, tmp_path, target)
                     finally:
@@ -1216,10 +1878,27 @@ class DouyinAPIClient:
         return True
 
     @staticmethod
-    def _emit_homepage_screenshot_request(sec_uid: str, save_path: Path) -> bool:
+    def _emit_homepage_screenshot_request(
+        sec_uid: str,
+        save_path: Path,
+        profile: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         try:
+            safe_profile: Dict[str, Any] = {}
+            if isinstance(profile, dict):
+                nickname = profile.get("nickname")
+                if isinstance(nickname, str) and nickname.strip():
+                    safe_profile["nickname"] = nickname.strip()[:200]
+                for key in ("follower_count", "following_count", "total_favorited"):
+                    count = profile.get(key)
+                    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                        safe_profile[key] = count
+
+            request = {"version": 1, "sec_uid": str(sec_uid), "save_path": str(save_path)}
+            if safe_profile:
+                request["profile"] = safe_profile
             payload = json.dumps(
-                {"version": 1, "sec_uid": str(sec_uid), "save_path": str(save_path)},
+                request,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
