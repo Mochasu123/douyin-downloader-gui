@@ -68,15 +68,22 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_health(port: int, timeout: float = 12.0) -> bool:
+def _wait_for_health(
+    port: int,
+    timeout: float = 20.0,
+    server_thread: Optional[threading.Thread] = None,
+) -> bool:
     deadline = time.monotonic() + timeout
     url = f"http://127.0.0.1:{port}/api/health"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=1.0) as resp:
+            with opener.open(url, timeout=1.0) as resp:
                 if resp.status == 200:
                     return True
         except Exception:
+            if server_thread is not None and not server_thread.is_alive():
+                return False
             time.sleep(0.1)
     return False
 
@@ -325,11 +332,30 @@ def _run_desktop_mode() -> int:
     uv_config = uvicorn.Config(app, host="127.0.0.1", port=port, log_config=None)
     server = uvicorn.Server(uv_config)
 
-    server_thread = threading.Thread(target=server.run, daemon=True)
+    server_errors: list[str] = []
+
+    def _run_server() -> None:
+        try:
+            server.run()
+        except BaseException:
+            server_errors.append(traceback.format_exc())
+
+    server_thread = threading.Thread(target=_run_server, daemon=True)
     server_thread.start()
 
-    if not _wait_for_health(port, timeout=12.0):
-        raise RuntimeError("Embedded desktop backend failed to start within timeout")
+    if not _wait_for_health(port, timeout=20.0, server_thread=server_thread):
+        detail = getattr(app.state, "startup_error", None) or (
+            server_errors[0]
+            if server_errors
+            else "Uvicorn server exited or timed out before /api/health responded"
+        )
+        try:
+            (PROJECT_ROOT / "desktop_startup_error.log").write_text(str(detail), encoding="utf-8")
+        except Exception:
+            pass
+        lines = [line.strip() for line in str(detail).splitlines() if line.strip()]
+        summary = lines[-1] if lines else "unknown error"
+        raise RuntimeError(f"Embedded desktop backend failed to start within timeout: {summary}")
 
     saved = _load_window_settings()
     rect = saved.get("window_rect") if isinstance(saved.get("window_rect"), dict) else {}

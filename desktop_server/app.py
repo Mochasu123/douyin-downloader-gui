@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -23,7 +24,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await runtime.startup()
+        app.state.startup_error = None
+        try:
+            await runtime.startup()
+        except BaseException:
+            app.state.startup_error = traceback.format_exc()
+            raise
         try:
             yield
         finally:

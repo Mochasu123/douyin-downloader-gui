@@ -299,3 +299,36 @@ def test_desktop_page_bridge_query_sanitization_and_wiring(tmp_path):
     asyncio.run(_run())
 
 
+def test_wait_for_health_fails_fast_and_bypasses_proxy(monkeypatch):
+    import threading
+    import time
+    import urllib.request
+    import desktop_app
+
+    dead_thread = threading.Thread(target=lambda: None)
+    dead_thread.start()
+    dead_thread.join()
+
+    built_handlers = []
+    orig_build_opener = urllib.request.build_opener
+
+    def _spy_build_opener(*handlers):
+        built_handlers.extend(handlers)
+        return orig_build_opener(*handlers)
+
+    monkeypatch.setattr(urllib.request, "build_opener", _spy_build_opener)
+
+    unused_port = desktop_app._find_free_port()
+    started = time.monotonic()
+    ok = desktop_app._wait_for_health(unused_port, timeout=10.0, server_thread=dead_thread)
+    elapsed = time.monotonic() - started
+
+    assert ok is False
+    assert elapsed < 3.0
+    assert any(
+        isinstance(h, urllib.request.ProxyHandler) and h.proxies == {}
+        for h in built_handlers
+    )
+
+
+

@@ -1,14 +1,55 @@
 $ErrorActionPreference = "Stop"
 
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Python = Join-Path $Repo ".venv\Scripts\python.exe"
 
-# 1. Back up user data from dist folder to root before PyInstaller deletes dist/!
+function Checkpoint-SqliteDb {
+    param([string]$DbPath, [string]$PythonExe)
+    if ((Test-Path -LiteralPath $DbPath) -and (Test-Path -LiteralPath $PythonExe)) {
+        try {
+            & $PythonExe -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" $DbPath
+        } catch {
+            Write-Warning "SQLite checkpoint skipped for ${DbPath}: $_"
+        }
+    }
+}
+
+function Sync-UserDataFile {
+    param(
+        [string]$SrcPath,
+        [string]$DstPath,
+        [string]$PythonExe,
+        [bool]$OnlyIfNewer = $false
+    )
+    if (!(Test-Path -LiteralPath $SrcPath)) {
+        return $false
+    }
+    if ($OnlyIfNewer -and (Test-Path -LiteralPath $DstPath)) {
+        $srcTime = (Get-Item -LiteralPath $SrcPath).LastWriteTimeUtc
+        $dstTime = (Get-Item -LiteralPath $DstPath).LastWriteTimeUtc
+        if ($srcTime -le $dstTime) {
+            return $false
+        }
+    }
+    $leaf = [System.IO.Path]::GetFileName($SrcPath)
+    if ($leaf -eq 'dy_downloader.db') {
+        Checkpoint-SqliteDb -DbPath $SrcPath -PythonExe $PythonExe
+        foreach ($sidecar in @("$DstPath-wal", "$DstPath-shm")) {
+            if (Test-Path -LiteralPath $sidecar) {
+                Remove-Item -LiteralPath $sidecar -Force
+            }
+        }
+    }
+    Copy-Item -LiteralPath $SrcPath -Destination $DstPath -Force
+    return $true
+}
+
+# 1. Back up newer user data from dist folder to root before PyInstaller deletes dist/!
 foreach ($File in @('config.yml', '.cookies.json', 'dy_downloader.db', 'desktop_settings.json')) {
     $DistFile = Join-Path $Repo "dist\DouyinDownloader\$File"
     $RootFile = Join-Path $Repo $File
-    if (Test-Path -LiteralPath $DistFile) {
-        Copy-Item -Path $DistFile -Destination $RootFile -Force
-        Write-Host "Backed up user data from dist: $File"
+    if (Sync-UserDataFile -SrcPath $DistFile -DstPath $RootFile -PythonExe $Python -OnlyIfNewer $true) {
+        Write-Host "Backed up newer user data from dist: $File"
     }
 }
 
@@ -113,11 +154,11 @@ Write-Host ""
 Write-Host "Build complete:"
 Write-Host (Join-Path $Repo "dist\DouyinDownloader\DouyinDownloader.exe")
 
-# 5. Copy user data back to dist folder
+# 5. Copy user data back to dist folder (WAL-safe)
 foreach ($File in @('config.yml', '.cookies.json', 'dy_downloader.db', 'desktop_settings.json')) {
     $Src = Join-Path $Repo $File
-    if (Test-Path -LiteralPath $Src) {
-        Copy-Item -Path $Src -Destination (Join-Path $Repo "dist\DouyinDownloader\$File") -Force
+    $Dst = Join-Path $Repo "dist\DouyinDownloader\$File"
+    if (Sync-UserDataFile -SrcPath $Src -DstPath $Dst -PythonExe $Python -OnlyIfNewer $false) {
         Write-Host "Restored user data: $File"
     }
 }
