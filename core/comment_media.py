@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from core.live_photo import merge_live_photo_files
+from core.live_photo import LIVE_MERGED_DIR_NAME, LIVE_RAW_DIR_NAME, merge_live_photo_files
 from utils.logger import setup_logger
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -99,38 +99,81 @@ def _dedupe(values: List[str]) -> List[str]:
     return result
 
 
+_WATERMARK_HINTS = (
+    "tplv-dy-water",
+    "dy-water",
+    "owner_watermark",
+    "watermark_image",
+    "watermark=1",
+    "playwm",
+)
+
+
+def _is_watermarked_url(url: str) -> bool:
+    normalized = str(url or "").lower()
+    return any(hint in normalized for hint in _WATERMARK_HINTS)
+
+
 def _ranked_image_urls(item: Dict[str, Any]) -> List[str]:
-    """按 原图→下载→中等→缩略 顺序收集镜像，最后加通用兜底。"""
+    """按 原图→下载→中等→缩略 顺序收集镜像，始终优先无水印 URL。"""
     urls: List[str] = []
-    for key in ("origin_url", "download_url", "medium_url", "thumb_url"):
+    for key in ("watermark_free_download_url_list", "origin_image", "origin_url",
+                "display_image", "download_url", "medium_url", "thumb_url"):
         urls.extend(_extract_urls(item.get(key)))
     urls.extend(_extract_urls(item.get("download_url_list")))
     urls.extend(_extract_urls(item.get("url_list")))
-    urls.extend(_extract_urls(item.get("display_image")))
     urls.extend(_extract_urls(item.get("owner_watermark_image")))
-    return _dedupe(urls)
+    deduped = _dedupe(urls)
+    watermark_free = [u for u in deduped if not _is_watermarked_url(u)]
+    watermarked = [u for u in deduped if _is_watermarked_url(u)]
+    return watermark_free + watermarked
+
+
+def _extract_bit_rate_play_urls(video: Dict[str, Any]) -> List[str]:
+    bit_rate = video.get("bit_rate")
+    if not isinstance(bit_rate, list):
+        return []
+    scored = []
+    for entry in bit_rate:
+        if not isinstance(entry, dict):
+            continue
+        br = _positive_int(entry.get("bit_rate"))
+        urls = _extract_urls(entry.get("play_addr"))
+        if urls:
+            scored.append((br, urls))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    result: List[str] = []
+    for _, urls in scored:
+        result.extend(urls)
+    return result
 
 
 def _live_video_urls(item: Dict[str, Any]) -> List[str]:
-    """收集动图视频源：``video_list`` / ``video`` / 平铺字段。"""
-    urls: List[str] = []
+    """收集动图视频源：``video_list`` / ``video`` / 平铺字段，无水印 ``play_addr`` 优先。"""
+    preferred: List[str] = []
+    fallback: List[str] = []
     video_list = item.get("video_list")
     if isinstance(video_list, list):
         for entry in video_list:
             if isinstance(entry, dict):
-                urls.extend(_extract_urls(entry.get("play_addr")))
-                urls.extend(_extract_urls(entry.get("download_addr")))
-                urls.extend(_extract_urls(entry.get("url_list")))
+                preferred.extend(_extract_bit_rate_play_urls(entry))
+                preferred.extend(_extract_urls(entry.get("play_addr")))
+                preferred.extend(_extract_urls(entry.get("url_list")))
+                fallback.extend(_extract_urls(entry.get("download_addr")))
             else:
-                urls.extend(_extract_urls(entry))
+                preferred.extend(_extract_urls(entry))
     video = item.get("video") if isinstance(item.get("video"), dict) else {}
     if video:
-        for key in ("play_addr", "play_addr_h264", "play_addr_265", "play_addr_256",
-                    "download_addr", "url_list"):
-            urls.extend(_extract_urls(video.get(key)))
-    for key in ("video_play_addr", "video_download_addr"):
-        urls.extend(_extract_urls(item.get(key)))
-    return _dedupe(urls)
+        preferred.extend(_extract_bit_rate_play_urls(video))
+        for key in ("play_addr", "play_addr_h264", "play_addr_265", "play_addr_256", "url_list"):
+            preferred.extend(_extract_urls(video.get(key)))
+        fallback.extend(_extract_urls(video.get("download_addr")))
+    preferred.extend(_extract_urls(item.get("video_play_addr")))
+    fallback.extend(_extract_urls(item.get("video_download_addr")))
+    deduped = _dedupe(preferred + fallback)
+    watermark_free = [u for u in deduped if not _is_watermarked_url(u)]
+    watermarked = [u for u in deduped if _is_watermarked_url(u)]
+    return watermark_free + watermarked
 
 
 def extract_comment_images(comment: Dict[str, Any]) -> List[CommentImage]:
@@ -229,21 +272,29 @@ class CommentMediaDownloader:
         image: CommentImage,
         save_dir: Path,
         stem: str,
+        *,
+        merge: bool = True,
+        format_mode: str = "universal",
     ) -> Dict[str, Optional[Path]]:
-        """下载动图：静态图 + 视频 + 合并文件，返回三类路径。"""
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        still = await self.download_image(image, save_dir, stem)
+        """下载动图：原始静图+视频存入 ``实况素材/``，合成动态图以同主文件名存入 ``合成动图/``。"""
+        base_dir = Path(save_dir)
+        raw_dir = base_dir / LIVE_RAW_DIR_NAME
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        still = await self.download_image(image, raw_dir, stem)
 
         video: Optional[Path] = None
         if image.live_video_urls:
-            video_path = save_dir / f"{stem}_live.mp4"
+            video_path = raw_dir / f"{stem}.mp4"
             video = await self._download_first_available(image.live_video_urls, video_path)
 
         merged: Optional[Path] = None
-        if still and video:
-            merged_path = save_dir / f"{stem}_live.jpg"
-            merged = merge_live_photo_files(still, video, merged_path)
+        if merge and still and video:
+            merged_dir = base_dir / LIVE_MERGED_DIR_NAME
+            merged_dir.mkdir(parents=True, exist_ok=True)
+            merged_path = merged_dir / f"{stem}.jpg"
+            merged = merge_live_photo_files(
+                still, video, merged_path, format_mode=format_mode
+            )
         return {"image": still, "video": video, "merged": merged}
 
     async def download_comment_images(
@@ -252,6 +303,8 @@ class CommentMediaDownloader:
         save_dir: Path,
         *,
         progress_callback=None,
+        merge_live: bool = True,
+        live_photo_format: str = "universal",
     ) -> Dict[str, Any]:
         """批量下载，返回 {"success": [...], "failed": [...]} 路径列表。"""
         save_dir = Path(save_dir)
@@ -263,7 +316,13 @@ class CommentMediaDownloader:
             stem = f"{image.comment_id}_{image.index + 1}"
             try:
                 if image.is_live:
-                    result = await self.download_live_photo(image, save_dir, stem)
+                    result = await self.download_live_photo(
+                        image,
+                        save_dir,
+                        stem,
+                        merge=merge_live,
+                        format_mode=live_photo_format,
+                    )
                     merged = result.get("merged")
                     if merged:
                         success.append(merged)

@@ -157,11 +157,14 @@ async def test_download_image_failure_returns_none(tmp_path):
 
 @pytest.mark.asyncio
 async def test_download_live_photo_merges(tmp_path):
+    from core.live_photo import LIVE_MERGED_DIR_NAME, LIVE_RAW_DIR_NAME
+
     image = extract_comment_images(_comment_with_images())[1]
     result = await _downloader().download_live_photo(image, tmp_path, "live")
-    assert result["image"] == tmp_path / "live.jpg"
-    assert result["video"] == tmp_path / "live_live.mp4"
-    assert result["merged"] == tmp_path / "live_live.jpg"
+    assert result["image"] == tmp_path / LIVE_RAW_DIR_NAME / "live.jpg"
+    assert result["video"] == tmp_path / LIVE_RAW_DIR_NAME / "live.mp4"
+    assert result["merged"] == tmp_path / LIVE_MERGED_DIR_NAME / "live.jpg"
+    assert result["image"].stem == result["video"].stem == result["merged"].stem == "live"
     assert result["merged"].exists()
     data = result["merged"].read_bytes()
     assert data.endswith(b"LIVE_000000000000004")
@@ -169,6 +172,8 @@ async def test_download_live_photo_merges(tmp_path):
 
 @pytest.mark.asyncio
 async def test_download_comment_images_reports_progress(tmp_path):
+    from core.live_photo import LIVE_MERGED_DIR_NAME, LIVE_RAW_DIR_NAME
+
     images = extract_comment_images(_comment_with_images())
     events = []
 
@@ -177,6 +182,38 @@ async def test_download_comment_images_reports_progress(tmp_path):
 
     result = await _downloader().download_comment_images(
         images, tmp_path, progress_callback=progress)
-    assert len(result["success"]) == 4  # 2 张静态图 + 1 动图（图+视频+合并）
+    assert len(result["success"]) == 4  # 1 张静态图 + 1 动图（原图+视频+合并）
     assert result["failed"] == []
     assert events == [(1, 2, 1, 0), (2, 2, 4, 0)]
+    # 混合评论中纯静态图留在根目录，动图分入 实况素材/ 与 合成动图/ 且主文件名一一对应
+    assert (tmp_path / "C1_1.webp").exists()
+    assert (tmp_path / LIVE_RAW_DIR_NAME / "C1_2.jpg").exists()
+    assert (tmp_path / LIVE_RAW_DIR_NAME / "C1_2.mp4").exists()
+    assert (tmp_path / LIVE_MERGED_DIR_NAME / "C1_2.jpg").exists()
+
+
+def test_comment_media_prefers_watermark_free_urls():
+    comment = {
+        "cid": "C2",
+        "image_list": [
+            {
+                "origin_url": {"url_list": ["https://cdn/watermark_image/1.jpg"]},
+                "watermark_free_download_url_list": ["https://cdn/clean/origin.jpg"],
+                "download_url": {"url_list": ["https://cdn/tplv-dy-water/1.jpg"]},
+                "medium_url": {"url_list": ["https://cdn/clean/medium.jpg"]},
+                "video": {
+                    "download_addr": {"url_list": ["https://cdn/playwm/live.mp4"]},
+                    "play_addr": {"url_list": ["https://cdn/clean/live_base.mp4"]},
+                    "bit_rate": [
+                        {"bit_rate": 1000, "play_addr": {"url_list": ["https://cdn/clean/live_hd.mp4"]}},
+                    ],
+                },
+            }
+        ],
+    }
+    images = extract_comment_images(comment)
+    assert len(images) == 1
+    assert images[0].urls[0] == "https://cdn/clean/origin.jpg"
+    assert "watermark" not in images[0].urls[1]
+    assert images[0].live_video_urls[0] == "https://cdn/clean/live_hd.mp4"
+    assert images[0].live_video_urls[-1] == "https://cdn/playwm/live.mp4"

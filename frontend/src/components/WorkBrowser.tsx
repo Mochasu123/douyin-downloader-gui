@@ -407,6 +407,18 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
                     <div className="flex items-center justify-between gap-1 pt-1 border-t text-[11px]" style={{ borderColor: 'var(--border-subtle)', color: 'var(--text-muted)' }}>
                       <span className="truncate">{item.author_name}</span>
                       <div className="flex items-center gap-0.5 shrink-0">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onDownloadSelected([item])
+                          }}
+                          disabled={st?.status === 'downloading'}
+                          title="单独下载此作品"
+                          aria-label="单独下载此作品"
+                          className="p-1 rounded-md hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] disabled:opacity-40 cursor-pointer"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                        </button>
                         {canComment && (
                           <button
                             onClick={(e) => {
@@ -566,6 +578,18 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
                     </td>
                     <td className="py-2 px-3 text-right">
                       <div className="flex items-center justify-end gap-1">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onDownloadSelected([item])
+                          }}
+                          disabled={itemStatuses[item.aweme_id]?.status === 'downloading'}
+                          title="单独下载此作品"
+                          aria-label="单独下载此作品"
+                          className="p-1.5 rounded-lg hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] disabled:opacity-40 cursor-pointer"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                        </button>
                         {canComment && (
                           <button
                             onClick={(e) => {

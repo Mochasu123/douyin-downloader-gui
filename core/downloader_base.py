@@ -16,7 +16,7 @@ from control import QueueManager, RateLimiter, RetryHandler
 from core import item_reasons
 from core.api_client import DouyinAPIClient
 from core.comments_collector import CommentsCollector, needs_backfill, read_comments_state
-from core.live_photo import merge_live_photo_files
+from core.live_photo import LIVE_MERGED_DIR_NAME, LIVE_RAW_DIR_NAME, merge_live_photo_files
 from core.metadata import (
     build_author_home_url,
     extract_author_sec_uid,
@@ -693,7 +693,12 @@ class BaseDownloader(ABC):
                         file_manager=self.file_manager,
                         api_client=self.api_client,
                     )
-                    await media_dl.download_comment_images(images, media_dir)
+                    await media_dl.download_comment_images(
+                        images,
+                        media_dir,
+                        merge_live=bool(self.config.get("live_photo_merge", True)),
+                        live_photo_format=str(self.config.get("live_photo_format") or "universal"),
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to download comment media for %s: %s", aweme_id, exc)
 
@@ -848,23 +853,6 @@ class BaseDownloader(ABC):
                         )
                     )
 
-            if self.config.get("music"):
-                music_url = self._extract_first_url(aweme_data.get("music", {}).get("play_url"))
-                if music_url:
-                    music_path = save_dir / f"{file_stem}_music.mp3"
-                    optional_assets.append(
-                        (
-                            music_path,
-                            self._download_with_retry(
-                                music_url,
-                                music_path,
-                                session,
-                                headers=self._download_headers(),
-                                optional=True,
-                            ),
-                        )
-                    )
-
         elif media_type == "gallery":
             image_url_candidates = self._collect_image_url_candidates(aweme_data)
             image_live_urls = self._collect_image_live_urls(aweme_data)
@@ -885,6 +873,12 @@ class BaseDownloader(ABC):
                 )
                 return self._note_item_reason(aweme_id, item_reasons.FAIL_GALLERY_NO_ASSETS)
 
+            live_indices = {idx for idx, _ in image_live_urls}
+            raw_live_dir = save_dir / LIVE_RAW_DIR_NAME
+            merged_live_dir = save_dir / LIVE_MERGED_DIR_NAME
+            if live_indices:
+                raw_live_dir.mkdir(parents=True, exist_ok=True)
+
             downloaded_image_by_index: Dict[int, Path] = {}
             for index, candidates in enumerate(image_url_candidates, start=1):
                 download_result: bool | Path = False
@@ -892,10 +886,11 @@ class BaseDownloader(ABC):
                 # 就是重试机制（每镜像单次尝试），单镜像才保留退避重试——
                 # 否则死镜像 × 每镜像 4 次退避嵌套，一张图最坏能拖数分钟。
                 use_backoff = len(candidates) == 1
+                image_target_dir = raw_live_dir if index in live_indices else save_dir
                 for url_index, image_url in enumerate(candidates):
                     is_last = url_index == len(candidates) - 1
                     suffix = self._infer_image_extension(image_url)
-                    image_path = save_dir / f"{file_stem}_{index}{suffix}"
+                    image_path = image_target_dir / f"{file_stem}_{index}{suffix}"
                     download_result = await self._download_with_retry(
                         image_url,
                         image_path,
@@ -920,7 +915,7 @@ class BaseDownloader(ABC):
             downloaded_live_by_index: List[Tuple[int, Path]] = []
             for index, live_url in image_live_urls:
                 suffix = Path(urlparse(live_url).path).suffix or ".mp4"
-                live_path = save_dir / f"{file_stem}_live_{index}{suffix}"
+                live_path = raw_live_dir / f"{file_stem}_{index}{suffix}"
                 success = await self._download_with_retry(
                     live_url,
                     live_path,
@@ -933,18 +928,41 @@ class BaseDownloader(ABC):
                 downloaded_files.append(live_path)
                 downloaded_live_by_index.append((index, live_path))
 
-            if self.config.get("live_photo_merge", True):
+            if self.config.get("live_photo_merge", True) and downloaded_live_by_index:
+                merged_live_dir.mkdir(parents=True, exist_ok=True)
+                live_format = str(self.config.get("live_photo_format") or "universal")
                 for index, live_path in downloaded_live_by_index:
                     still_path = downloaded_image_by_index.get(index)
                     if still_path is None:
                         continue
-                    merged_path = save_dir / f"{file_stem}_live_{index}.jpg"
-                    if merge_live_photo_files(still_path, live_path, merged_path):
+                    merged_path = merged_live_dir / f"{file_stem}_{index}.jpg"
+                    if merge_live_photo_files(
+                        still_path, live_path, merged_path, format_mode=live_format
+                    ):
                         downloaded_files.append(merged_path)
             primary_media_downloaded = True
         else:
             logger.error("Unsupported media type for aweme %s: %s", aweme_id, media_type)
             return self._note_item_reason(aweme_id, item_reasons.FAIL_UNSUPPORTED_MEDIA)
+
+        if self.config.get("music"):
+            music_info = aweme_data.get("music")
+            music_play = music_info.get("play_url") if isinstance(music_info, dict) else None
+            music_url = self._extract_first_url(music_play)
+            if music_url:
+                music_path = save_dir / f"{file_stem}_music.mp3"
+                optional_assets.append(
+                    (
+                        music_path,
+                        self._download_with_retry(
+                            music_url,
+                            music_path,
+                            session,
+                            headers=self._download_headers(),
+                            optional=True,
+                        ),
+                    )
+                )
 
         if self.config.get("avatar"):
             author = aweme_data.get("author", {})

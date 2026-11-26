@@ -1054,10 +1054,10 @@ async def test_download_aweme_assets_gallery_downloads_live_photo_videos(tmp_pat
     )
 
     assert success is True
-    assert any(path.suffix == ".webp" for path in saved_paths)
+    assert any(path.suffix == ".webp" and path.parent.name == "实况素材" for path in saved_paths)
     assert sum(path.suffix == ".mp4" for path in saved_paths) == 2
-    assert any("_live_1.mp4" in path.name for path in saved_paths)
-    assert any("_live_2.mp4" in path.name for path in saved_paths)
+    assert any(path.name.endswith("_1.mp4") and path.parent.name == "实况素材" for path in saved_paths)
+    assert any(path.name.endswith("_2.mp4") and path.parent.name == "实况素材" for path in saved_paths)
 
     await api_client.close()
 
@@ -1371,9 +1371,9 @@ async def test_download_aweme_assets_gallery_succeeds_with_only_live_videos(tmp_
 
     assert success is True
     assert len(saved_paths) == 2
-    assert all(path.suffix == ".mp4" for path in saved_paths)
-    assert any("_live_1.mp4" in path.name for path in saved_paths)
-    assert any("_live_2.mp4" in path.name for path in saved_paths)
+    assert all(path.suffix == ".mp4" and path.parent.name == "实况素材" for path in saved_paths)
+    assert any(path.name.endswith("_1.mp4") for path in saved_paths)
+    assert any(path.name.endswith("_2.mp4") for path in saved_paths)
 
     await api_client.close()
 
@@ -1394,7 +1394,7 @@ async def test_download_aweme_assets_gallery_fails_when_live_video_download_fail
 
     async def _fake_download_with_retry(self, _url, save_path, _session, **_kwargs):
         saved_paths.append(save_path)
-        if save_path.name.endswith("_live_2.mp4"):
+        if save_path.name.endswith("_2.mp4"):
             return False
         return True
 
@@ -1419,16 +1419,16 @@ async def test_download_aweme_assets_gallery_fails_when_live_video_download_fail
     )
 
     assert success is False
-    assert any(path.name.endswith(".webp") for path in saved_paths)
-    assert any(path.name.endswith("_live_1.mp4") for path in saved_paths)
-    assert any(path.name.endswith("_live_2.mp4") for path in saved_paths)
+    assert any(path.name.endswith(".webp") and path.parent.name == "实况素材" for path in saved_paths)
+    assert any(path.name.endswith("_1.mp4") and path.parent.name == "实况素材" for path in saved_paths)
+    assert any(path.name.endswith("_2.mp4") and path.parent.name == "实况素材" for path in saved_paths)
 
     await api_client.close()
 
 
 @pytest.mark.asyncio
 async def test_gallery_live_photo_index_matches_its_image(tmp_path, monkeypatch):
-    """#239：实况视频的序号要和对应静态图一致，不能按实况出现顺序另起编号。"""
+    """#239：实况视频的序号要和对应静态图一致，纯静态图留在主目录，实况配对放在 实况素材/。"""
     downloader, api_client = _build_downloader(tmp_path)
     downloader.config.update(music=False, cover=False, avatar=False, json=False, folderstyle=True)
 
@@ -1464,9 +1464,19 @@ async def test_gallery_live_photo_index_matches_its_image(tmp_path, monkeypatch)
     )
 
     assert success is True
-    images = sorted(p.name.rsplit("_", 1)[1] for p in saved_paths if p.suffix == ".webp")
-    lives = sorted(p.name.rsplit("_live_", 1)[1] for p in saved_paths if "_live_" in p.name)
-    assert images == ["1.webp", "2.webp", "3.webp"]
+    raw_images = sorted(
+        p.name.rsplit("_", 1)[1]
+        for p in saved_paths
+        if p.suffix == ".webp" and p.parent.name == "实况素材"
+    )
+    static_images = sorted(
+        p.name.rsplit("_", 1)[1]
+        for p in saved_paths
+        if p.suffix == ".webp" and p.parent.name != "实况素材"
+    )
+    lives = sorted(p.name.rsplit("_", 1)[1] for p in saved_paths if p.suffix == ".mp4")
+    assert raw_images == ["1.webp", "3.webp"]
+    assert static_images == ["2.webp"]
     assert lives == ["1.mp4", "3.mp4"]
 
     await api_client.close()
@@ -1819,3 +1829,67 @@ async def test_encrypted_video_aborts_before_recording_success(tmp_path, monkeyp
     assert ok is False
     assert marked == []
     assert not list(tmp_path.rglob("*.mp4"))
+
+
+@pytest.mark.asyncio
+async def test_gallery_downloads_music_when_enabled(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=True,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=False,
+        live_photo_merge=True,
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+
+    async def _fake_download_with_retry(self, url, save_path, _session, **_kwargs):
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        if url.endswith(".jpg"):
+            save_path.write_bytes(b"\xff\xd8\xff\xe0" + b"J" * 32)
+        elif url.endswith(".mp4"):
+            save_path.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"M" * 32)
+        else:
+            save_path.write_bytes(b"MP3")
+        return save_path if _kwargs.get("return_saved_path") else True
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(downloader, VideoDownloader)
+
+    aweme_data = {
+        "aweme_id": "7712005420173470399",
+        "aweme_type": 68,
+        "desc": "图文配乐与实况分离目录",
+        "create_time": 1747353600,
+        "music": {"play_url": {"url_list": ["https://example.com/bgm.mp3"]}},
+        "images": [
+            {
+                "url_list": ["https://example.com/p1.jpg"],
+                "video": {"play_addr": {"url_list": ["https://example.com/p1.mp4"]}},
+            },
+            {
+                "url_list": ["https://example.com/p2.jpg"],
+            },
+        ],
+    }
+
+    ok = await downloader._download_aweme_assets(aweme_data, author_name="Eros", mode="post")
+    assert ok is True
+
+    raw_imgs = list(tmp_path.rglob("实况素材/*_1.jpg"))
+    raw_mp4s = list(tmp_path.rglob("实况素材/*_1.mp4"))
+    merged_imgs = list(tmp_path.rglob("合成动图/*_1.jpg"))
+    static_imgs = [p for p in tmp_path.rglob("*_2.jpg") if p.parent.name not in ("实况素材", "合成动图")]
+    music_files = list(tmp_path.rglob("*_music.mp3"))
+
+    assert len(raw_imgs) == 1 and len(raw_mp4s) == 1 and len(merged_imgs) == 1
+    assert raw_imgs[0].stem == raw_mp4s[0].stem == merged_imgs[0].stem
+    assert len(static_imgs) == 1
+    assert len(music_files) == 1
+
+    await api_client.close()
+

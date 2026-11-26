@@ -424,6 +424,31 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               </label>
             ))}
           </div>
+
+          <div className="flex flex-wrap items-center gap-3 text-xs pt-1">
+            <span className="w-28 shrink-0" style={{ color: 'var(--text-secondary)' }}>
+              实况动图格式
+            </span>
+            <select
+              value={draft.config.live_photo_format || 'universal'}
+              disabled={!draft.config.live_photo_merge}
+              onChange={(e) => updateCfg('live_photo_format', e.target.value)}
+              className="flex-1 max-w-md px-3 py-1.5 rounded-xl border outline-none disabled:opacity-50"
+              style={{
+                backgroundColor: 'var(--bg-app)',
+                borderColor: 'var(--border-subtle)',
+                color: 'var(--text-primary)',
+              }}
+            >
+              <option value="universal">
+                全安卓通用 + 荣耀/华为（小米 / OPPO / vivo / 三星 / 荣耀 / Google）
+              </option>
+              <option value="android">
+                标准安卓 Motion Photo（无尾标：小米 / OPPO / vivo / 三星 / Google）
+              </option>
+              <option value="huawei">荣耀 / 华为传统格式（仅 LIVE_ 尾标）</option>
+            </select>
+          </div>
         </section>
 
         {/* 4. Performance & Network */}

@@ -399,6 +399,7 @@ class DesktopRuntime:
                 "avatar": bool(cfg.get("avatar", False)),
                 "json": bool(cfg.get("json", False)),
                 "live_photo_merge": bool(cfg.get("live_photo_merge", True)),
+                "live_photo_format": str(cfg.get("live_photo_format") or "universal"),
                 "homepage_screenshot": bool(cfg.get("homepage_screenshot", False)),
                 "author_url": bool(cfg.get("author_url", False)),
                 "download_pinned": bool(cfg.get("download_pinned", False)),
@@ -1547,7 +1548,11 @@ class DesktopRuntime:
                 )
 
             result = await downloader.download_comment_images(
-                selected, target_dir, progress_callback=_progress
+                selected,
+                target_dir,
+                progress_callback=_progress,
+                merge_live=bool(cfg.get("live_photo_merge", True)),
+                live_photo_format=str(cfg.get("live_photo_format") or "universal"),
             )
 
         return {

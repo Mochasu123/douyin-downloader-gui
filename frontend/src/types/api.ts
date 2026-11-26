@@ -182,6 +182,7 @@ export interface AppConfigPayload {
   avatar: boolean
   json: boolean
   live_photo_merge: boolean
+  live_photo_format: string
   homepage_screenshot: boolean
   author_url: boolean
   download_pinned: boolean
