@@ -50,6 +50,12 @@ export function proxyImageUrl(url: string | null | undefined): string {
   return `/api/proxy/image?url=${encodeURIComponent(url)}`
 }
 
+export function proxyMediaUrl(url: string | null | undefined): string {
+  if (!url) return ''
+  if (url.startsWith('/api/')) return url
+  return `/api/proxy/media?url=${encodeURIComponent(url)}`
+}
+
 export const URL_TYPE_LABELS: Record<string, string> = {
   video: '单个视频',
   gallery: '图文作品',

@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from desktop_server.state import DesktopRuntime, default_download_dir
@@ -22,18 +22,28 @@ from desktop_server.state import DesktopRuntime, default_download_dir
 _ALLOWED_IMAGE_HOST_SUFFIXES = (
     "douyinpic.com",
     "douyincdn.com",
+    "douyinstatic.com",
     "douyinvod.com",
     "bytedance.com",
+    "bytegecko.com",
     "byteimg.com",
     "ibytedtos.com",
+    "bytetos.com",
+    "bytevcloudapi.com",
+    "bytecdn.cn",
+    "byteicdn.com",
     "amemv.com",
     "snssdk.com",
     "toutiao.com",
+    "toutiaovod.com",
     "pstatp.com",
     "iesdouyin.com",
     "douyin.com",
     "zjcdn.com",
-    "byteicdn.com",
+    "ixigua.com",
+    "volccdn.com",
+    "vlabvod.com",
+    "vlabstatic.com",
 )
 
 
@@ -76,6 +86,9 @@ class PreviewStartPayload(BaseModel):
     start_time: str = ""
     end_time: str = ""
     increase: Optional[bool] = None
+    scope: Optional[str] = None
+    append: bool = False
+    auto_download: bool = False
 
 
 class DeleteParseHistoryPayload(BaseModel):
@@ -217,12 +230,31 @@ def build_router(runtime: DesktopRuntime) -> APIRouter:
             start_time=payload.start_time,
             end_time=payload.end_time,
             increase=payload.increase,
+            scope=payload.scope,
+            append=payload.append,
+            auto_download=payload.auto_download,
         )
         return {"preview_id": preview_id}
 
     @router.post("/api/preview/cancel/{preview_id}")
     async def preview_cancel(preview_id: str) -> Dict[str, Any]:
         return {"cancelled": runtime.cancel_preview(preview_id)}
+
+    @router.get("/api/preview/workspace")
+    async def preview_workspace() -> Dict[str, Any]:
+        return runtime.get_preview_workspace_payload()
+
+    @router.delete("/api/preview/workspace/{scope}")
+    async def clear_preview_workspace(scope: str) -> Dict[str, Any]:
+        if scope not in ("link", "creator"):
+            raise HTTPException(status_code=400, detail="Invalid workspace scope")
+        return {"cleared": runtime.clear_preview_workspace(scope)}
+
+    @router.delete("/api/preview/workspace/{scope}/item/{aweme_id}")
+    async def remove_preview_workspace_item(scope: str, aweme_id: str) -> Dict[str, Any]:
+        if scope not in ("link", "creator"):
+            raise HTTPException(status_code=400, detail="Invalid workspace scope")
+        return {"removed": runtime.remove_preview_workspace_item(scope, aweme_id)}
 
     @router.get("/api/preview/history")
     async def preview_history(scope: str = Query("link")) -> Dict[str, Any]:
@@ -246,6 +278,19 @@ def build_router(runtime: DesktopRuntime) -> APIRouter:
                 total += await runtime.db.clear_parse_history(k)
             return {"deleted": total}
         return {"deleted": 0}
+
+    @router.get("/api/preview/{preview_id}/item/{aweme_id}/media")
+    async def preview_item_media(
+        preview_id: str,
+        aweme_id: str,
+        refresh: bool = Query(False),
+    ) -> Dict[str, Any]:
+        try:
+            return await runtime.get_preview_item_media(preview_id, aweme_id, refresh=refresh)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @router.get("/api/preview/{preview_id}")
     async def preview_session(preview_id: str) -> Dict[str, Any]:
@@ -512,6 +557,65 @@ def build_router(runtime: DesktopRuntime) -> APIRouter:
             raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @router.get("/api/proxy/media")
+    async def proxy_media(request: Request, url: str = Query(...)):
+        if not _is_allowed_image_url(url):
+            raise HTTPException(status_code=403, detail="Disallowed media host")
+        if runtime.http_session is None or runtime.http_session.closed:
+            raise HTTPException(status_code=503, detail="HTTP session unavailable")
+
+        cfg = runtime.build_config_loader()
+        proxy = (cfg.get("proxy") or "").strip() or None
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/139.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.douyin.com/",
+            "Accept": "*/*",
+        }
+        incoming_range = request.headers.get("range")
+        if incoming_range:
+            headers["Range"] = incoming_range
+
+        try:
+            resp = await runtime.http_session.get(
+                url,
+                headers=headers,
+                proxy=proxy,
+                allow_redirects=True,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if resp.status not in (200, 206):
+            status_code = resp.status
+            await resp.release()
+            raise HTTPException(status_code=status_code, detail="Upstream media error")
+
+        out_headers: Dict[str, str] = {"Accept-Ranges": "bytes"}
+        for key in ("Content-Length", "Content-Range"):
+            val = resp.headers.get(key)
+            if val:
+                out_headers[key] = val
+        media_type = (resp.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
+
+        async def _stream():
+            try:
+                async for chunk in resp.content.iter_chunked(65536):
+                    if chunk:
+                        yield chunk
+            finally:
+                await resp.release()
+
+        return StreamingResponse(
+            _stream(),
+            status_code=resp.status,
+            media_type=media_type,
+            headers=out_headers,
+        )
 
     @router.get("/api/local-avatar/{sec_uid}")
     async def local_avatar(sec_uid: str):

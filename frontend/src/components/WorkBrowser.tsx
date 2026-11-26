@@ -3,12 +3,16 @@ import {
   Check,
   Copy,
   Download,
+  Eye,
   Heart,
   LayoutGrid,
   List,
   MessageSquare,
+  Play,
   Search,
   Sparkles,
+  Trash2,
+  X,
 } from 'lucide-react'
 import type { JobItemState, PreviewItem, ViewMode } from '../types/api'
 import { formatCount, proxyImageUrl } from '../lib/format'
@@ -22,6 +26,9 @@ interface WorkBrowserProps {
   onChangeViewMode: (mode: ViewMode) => void
   onDownloadSelected: (items: PreviewItem[]) => void
   onOpenComments: (item: PreviewItem) => void
+  onPreviewItem: (item: PreviewItem) => void
+  onRemoveItem?: (item: PreviewItem) => void
+  onClearItems?: () => void
   itemStatuses?: Record<string, JobItemState>
   loading?: boolean
   emptyHint?: string
@@ -35,6 +42,9 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
   onChangeViewMode,
   onDownloadSelected,
   onOpenComments,
+  onPreviewItem,
+  onRemoveItem,
+  onClearItems,
   itemStatuses = {},
   loading = false,
   emptyHint = '输入抖音链接或博主主页后，解析结果将实时展示在这里',
@@ -235,6 +245,21 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
             {allVisibleSelected ? '取消全选' : `全选 (${filtered.length})`}
           </button>
 
+          {onClearItems && items.length > 0 && (
+            <button
+              onClick={onClearItems}
+              title="清空当前预览列表"
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors hover:bg-[var(--danger-soft)] cursor-pointer"
+              style={{
+                borderColor: 'var(--border-subtle)',
+                color: 'var(--text-muted)',
+              }}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>清空</span>
+            </button>
+          )}
+
           <div
             className="flex p-0.5 rounded-xl border"
             style={{ backgroundColor: 'var(--bg-app)', borderColor: 'var(--border-subtle)' }}
@@ -310,7 +335,7 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
               return (
                 <div
                   key={item.aweme_id}
-                  onClick={() => toggleOne(item.aweme_id)}
+                  onClick={() => onPreviewItem(item)}
                   className="group rounded-2xl border overflow-hidden cursor-pointer transition-all duration-150 flex flex-col hover:-translate-y-0.5"
                   style={{
                     backgroundColor: 'var(--bg-surface)',
@@ -328,8 +353,14 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
                     />
 
                     {/* Top-left selection checkbox */}
-                    <div
-                      className={`absolute top-2.5 left-2.5 w-6 h-6 rounded-lg flex items-center justify-center transition-all border ${
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        toggleOne(item.aweme_id)
+                      }}
+                      title={selected ? '取消选中' : '选中作品'}
+                      className={`absolute top-2.5 left-2.5 w-6 h-6 rounded-lg flex items-center justify-center transition-all border cursor-pointer z-10 ${
                         selected
                           ? 'opacity-100 scale-100'
                           : 'opacity-0 group-hover:opacity-100 bg-black/45 border-white/50 text-white'
@@ -341,6 +372,18 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
                       }
                     >
                       {selected && <Check className="w-3.5 h-3.5 stroke-[2.5]" />}
+                    </button>
+
+                    {/* Centered hover preview pill */}
+                    <div className="pointer-events-none absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                      <span className="px-2.5 py-1 rounded-full bg-black/60 text-white text-[11px] font-medium backdrop-blur-xs inline-flex items-center gap-1 shadow-sm">
+                        {item.media_type === '视频' || item.is_live_photo ? (
+                          <Play className="w-3 h-3 fill-current" />
+                        ) : (
+                          <Eye className="w-3 h-3" />
+                        )}
+                        <span>点击预览</span>
+                      </span>
                     </div>
 
                     {/* Top-right media pill */}
@@ -442,6 +485,18 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
                             <Copy className="w-3.5 h-3.5" />
                           )}
                         </button>
+                        {onRemoveItem && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              onRemoveItem(item)
+                            }}
+                            title="从预览列表移除"
+                            className="p-1 rounded-md hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -506,7 +561,7 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
                 return (
                   <tr
                     key={item.aweme_id}
-                    onClick={() => toggleOne(item.aweme_id)}
+                    onClick={() => onPreviewItem(item)}
                     className="border-b transition-colors cursor-pointer hover:bg-[var(--bg-muted)]"
                     style={{
                       borderColor: 'var(--border-subtle)',
@@ -581,6 +636,16 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
                         <button
                           onClick={(e) => {
                             e.stopPropagation()
+                            onPreviewItem(item)
+                          }}
+                          title="预览作品"
+                          className="p-1.5 rounded-lg hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] cursor-pointer"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
                             onDownloadSelected([item])
                           }}
                           disabled={itemStatuses[item.aweme_id]?.status === 'downloading'}
@@ -609,6 +674,18 @@ export const WorkBrowser: React.FC<WorkBrowserProps> = ({
                         >
                           <Copy className="w-3.5 h-3.5" />
                         </button>
+                        {onRemoveItem && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              onRemoveItem(item)
+                            }}
+                            title="移除"
+                            className="p-1.5 rounded-lg hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>

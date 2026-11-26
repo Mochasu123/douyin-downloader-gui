@@ -32,12 +32,14 @@ interface DownloadPageProps {
   viewMode: ViewMode
   onChangeViewMode: (mode: ViewMode) => void
   itemStatuses: Record<string, JobItemState>
-  onStartPreview: (urls: string[]) => void
+  onStartPreview: (urls: string[], autoDownload?: boolean) => void
   onCancelPreview: () => void
   onStartDownload: (items: PreviewItem[]) => void
-  onQuickDownloadUrls: (urls: string[]) => void
   onJumpToCreator: (url: string) => void
   onOpenComments: (item: PreviewItem) => void
+  onPreviewItem: (item: PreviewItem) => void
+  onRemoveItem: (item: PreviewItem) => void
+  onClearItems: () => void
   onToast: (kind: 'info' | 'success' | 'warning' | 'error', title: string, detail?: string) => void
 }
 
@@ -55,9 +57,11 @@ export const DownloadPage: React.FC<DownloadPageProps> = ({
   onStartPreview,
   onCancelPreview,
   onStartDownload,
-  onQuickDownloadUrls,
   onJumpToCreator,
   onOpenComments,
+  onPreviewItem,
+  onRemoveItem,
+  onClearItems,
   onToast,
 }) => {
   const [rawText, setRawText] = useState('')
@@ -127,16 +131,16 @@ export const DownloadPage: React.FC<DownloadPageProps> = ({
       onToast('warning', '请先输入或粘贴至少一个抖音链接')
       return
     }
-    onStartPreview(targets)
+    onStartPreview(targets, false)
   }
 
-  const handleDirectDownload = () => {
+  const handleParseAndDownload = () => {
     const targets = validUrls.length > 0 ? validUrls : rawText.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
     if (targets.length === 0) {
       onToast('warning', '请先输入或粘贴至少一个抖音链接')
       return
     }
-    onQuickDownloadUrls(targets)
+    onStartPreview(targets, true)
   }
 
   return (
@@ -319,12 +323,13 @@ export const DownloadPage: React.FC<DownloadPageProps> = ({
               </button>
             )}
             <button
-              onClick={handleDirectDownload}
-              className="flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-xs font-semibold text-white cursor-pointer shadow-xs"
+              onClick={handleParseAndDownload}
+              disabled={previewLoading}
+              className="flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-xs font-semibold text-white cursor-pointer shadow-xs disabled:opacity-45"
               style={{ backgroundColor: 'var(--accent)' }}
             >
               <Download className="w-3.5 h-3.5" />
-              <span>直接下载</span>
+              <span>解析并下载</span>
             </button>
           </div>
         </div>
@@ -339,6 +344,9 @@ export const DownloadPage: React.FC<DownloadPageProps> = ({
         onChangeViewMode={onChangeViewMode}
         onDownloadSelected={onStartDownload}
         onOpenComments={onOpenComments}
+        onPreviewItem={onPreviewItem}
+        onRemoveItem={onRemoveItem}
+        onClearItems={onClearItems}
         itemStatuses={itemStatuses}
         loading={previewLoading}
       />

@@ -7,6 +7,8 @@ import type {
   HistoryStats,
   LoginFlowState,
   ParseHistoryEntry,
+  PreviewMediaDetail,
+  PreviewWorkspacePayload,
   SettingsPayload,
 } from '../types/api'
 
@@ -90,6 +92,9 @@ export const api = {
     start_time?: string
     end_time?: string
     increase?: boolean | null
+    scope?: 'link' | 'creator'
+    append?: boolean
+    auto_download?: boolean
   }) =>
     request<{ preview_id: string }>('/api/preview/start', {
       method: 'POST',
@@ -97,6 +102,18 @@ export const api = {
     }),
   cancelPreview: (previewId: string) =>
     request<{ cancelled: boolean }>(`/api/preview/cancel/${previewId}`, { method: 'POST' }),
+  getPreviewWorkspace: () =>
+    request<PreviewWorkspacePayload>('/api/preview/workspace'),
+  clearPreviewWorkspace: (scope: 'link' | 'creator') =>
+    request<{ cleared: boolean }>(`/api/preview/workspace/${scope}`, { method: 'DELETE' }),
+  removePreviewWorkspaceItem: (scope: 'link' | 'creator', awemeId: string) =>
+    request<{ removed: boolean }>(`/api/preview/workspace/${scope}/item/${encodeURIComponent(awemeId)}`, {
+      method: 'DELETE',
+    }),
+  getPreviewItemMedia: (previewId: string, awemeId: string, refresh = false) =>
+    request<PreviewMediaDetail>(
+      `/api/preview/${encodeURIComponent(previewId)}/item/${encodeURIComponent(awemeId)}/media?refresh=${refresh ? 'true' : 'false'}`
+    ),
   getParseHistory: (scope: 'link' | 'user') =>
     request<{ items: ParseHistoryEntry[] }>(`/api/preview/history?scope=${scope}`),
   deleteParseHistory: (payload: { ids?: number[]; scope?: 'link' | 'user' }) =>

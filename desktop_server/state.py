@@ -9,9 +9,11 @@ import os
 import time
 import uuid
 from copy import deepcopy
+from dataclasses import asdict, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import yaml
@@ -38,6 +40,34 @@ logger = setup_logger("DesktopServer")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+_PREVIEW_ITEM_FIELDS = frozenset(f.name for f in fields(PreviewItem))
+
+
+def _preview_item_to_persisted_dict(item: PreviewItem) -> Dict[str, Any]:
+    return asdict(item)
+
+
+def _preview_item_from_persisted_dict(data: Dict[str, Any]) -> PreviewItem:
+    filtered = {k: v for k, v in (data or {}).items() if k in _PREVIEW_ITEM_FIELDS}
+    if filtered.get("raw") is None:
+        filtered["raw"] = {}
+    return PreviewItem(**filtered)
+
+
+def _url_is_expired(url: str, margin_seconds: int = 120) -> bool:
+    if not url:
+        return True
+    try:
+        qs = parse_qs(urlparse(url).query)
+        raw_exp = (qs.get("x-expires") or qs.get("X-Expires") or [None])[0]
+        if raw_exp is None:
+            return False
+        exp = int(raw_exp)
+        return exp > 0 and exp < (time.time() + margin_seconds)
+    except (TypeError, ValueError):
+        return False
 
 
 def default_download_dir() -> str:
@@ -200,6 +230,11 @@ class DesktopRuntime:
             proxy_provider=self._get_proxy,
         )
 
+        # Persistent preview workspace
+        self.workspace_cache_path = self.cache_dir / "preview_workspace.json"
+        self._workspace_ids: Dict[str, str] = {"link": "ws_link", "creator": "ws_creator"}
+        self._workspace_creator_url: str = ""
+
     async def startup(self) -> None:
         self.event_bus.bind_loop(asyncio.get_running_loop())
         self.thumb_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +250,7 @@ class DesktopRuntime:
         self.db = Database(str(self.db_path))
         await self.db.initialize()
         await self._restore_terminal_jobs()
+        self._load_preview_workspace()
 
         connector = aiohttp.TCPConnector(limit=32, ttl_dns_cache=300)
         self.http_session = aiohttp.ClientSession(
@@ -682,6 +718,125 @@ class DesktopRuntime:
             results.append({"url": url, "type": url_type})
         return results
 
+    def _init_workspace_session(self, pid: str) -> Dict[str, Any]:
+        sess = {
+            "preview_id": pid,
+            "items": [],
+            "by_id": {},
+            "meta": None,
+            "status": "done",
+        }
+        self.preview_sessions[pid] = sess
+        return sess
+
+    def _load_preview_workspace(self) -> None:
+        for pid in self._workspace_ids.values():
+            if pid not in self.preview_sessions:
+                self._init_workspace_session(pid)
+        if not self.workspace_cache_path.exists():
+            return
+        try:
+            payload = json.loads(self.workspace_cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to load preview workspace cache: %s", exc)
+            return
+        if not isinstance(payload, dict):
+            return
+
+        self._workspace_creator_url = str(payload.get("creator_url") or "")
+        for scope, pid in self._workspace_ids.items():
+            raw_scope = payload.get(scope)
+            if not isinstance(raw_scope, dict):
+                continue
+            items: List[PreviewItem] = []
+            by_id: Dict[str, PreviewItem] = {}
+            for raw_item in raw_scope.get("items") or []:
+                if not isinstance(raw_item, dict):
+                    continue
+                try:
+                    p_item = _preview_item_from_persisted_dict(raw_item)
+                except Exception:
+                    continue
+                if not p_item.aweme_id or p_item.aweme_id in by_id:
+                    continue
+                items.append(p_item)
+                by_id[p_item.aweme_id] = p_item
+            self.preview_sessions[pid] = {
+                "preview_id": pid,
+                "items": items,
+                "by_id": by_id,
+                "meta": raw_scope.get("meta") if isinstance(raw_scope.get("meta"), dict) else None,
+                "status": "done",
+            }
+
+    def _save_preview_workspace(self) -> None:
+        try:
+            self.workspace_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            link_sess = self.preview_sessions.get(self._workspace_ids["link"]) or {}
+            creator_sess = self.preview_sessions.get(self._workspace_ids["creator"]) or {}
+            data = {
+                "version": 1,
+                "creator_url": self._workspace_creator_url,
+                "link": {
+                    "meta": link_sess.get("meta"),
+                    "items": [
+                        _preview_item_to_persisted_dict(it)
+                        for it in list(link_sess.get("items") or [])[:300]
+                    ],
+                },
+                "creator": {
+                    "meta": creator_sess.get("meta"),
+                    "items": [
+                        _preview_item_to_persisted_dict(it)
+                        for it in list(creator_sess.get("items") or [])[:500]
+                    ],
+                },
+            }
+            tmp_path = self.workspace_cache_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp_path, self.workspace_cache_path)
+        except Exception as exc:
+            logger.warning("Failed to save preview workspace cache: %s", exc)
+
+    def get_preview_workspace_payload(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for scope, pid in self._workspace_ids.items():
+            sess = self.preview_sessions.get(pid) or self._init_workspace_session(pid)
+            entry: Dict[str, Any] = {
+                "preview_id": pid,
+                "meta": sess.get("meta"),
+                "items": [it.to_summary_dict() for it in sess.get("items") or []],
+            }
+            if scope == "creator":
+                entry["url"] = self._workspace_creator_url
+            out[scope] = entry
+        return out
+
+    def clear_preview_workspace(self, scope: str) -> bool:
+        pid = self._workspace_ids.get(scope)
+        if not pid:
+            return False
+        self._init_workspace_session(pid)
+        if scope == "creator":
+            self._workspace_creator_url = ""
+        self._save_preview_workspace()
+        return True
+
+    def remove_preview_workspace_item(self, scope: str, aweme_id: str) -> bool:
+        pid = self._workspace_ids.get(scope)
+        if not pid:
+            return False
+        sess = self.preview_sessions.get(pid)
+        if not sess:
+            return False
+        before = len(sess["items"])
+        sess["items"] = [it for it in sess["items"] if it.aweme_id != aweme_id]
+        sess["by_id"].pop(aweme_id, None)
+        if len(sess["items"]) == before:
+            return False
+        self._save_preview_workspace()
+        return True
+
     def start_preview(
         self,
         *,
@@ -693,20 +848,37 @@ class DesktopRuntime:
         start_time: str = "",
         end_time: str = "",
         increase: Optional[bool] = None,
+        scope: Optional[str] = None,
+        append: bool = False,
+        auto_download: bool = False,
     ) -> str:
-        pid = (preview_id or "").strip() or uuid.uuid4().hex[:12]
-        # Keep bounded preview sessions
-        if len(self.preview_sessions) >= 15:
-            oldest = next(iter(self.preview_sessions))
-            self.preview_sessions.pop(oldest, None)
+        if scope in self._workspace_ids:
+            pid = (preview_id or "").strip() or self._workspace_ids[scope]
+        else:
+            pid = (preview_id or "").strip() or uuid.uuid4().hex[:12]
 
-        self.preview_sessions[pid] = {
-            "preview_id": pid,
-            "items": [],
-            "by_id": {},
-            "meta": None,
-            "status": "running",
-        }
+        # Keep bounded ad-hoc preview sessions without ever evicting workspace sessions
+        protected = set(self._workspace_ids.values())
+        if pid not in self.preview_sessions and len(self.preview_sessions) >= 15:
+            for existing_id in list(self.preview_sessions):
+                if existing_id not in protected:
+                    self.preview_sessions.pop(existing_id, None)
+                    break
+
+        if scope == "creator" and sec_uid:
+            self._workspace_creator_url = str(sec_uid).strip()
+
+        if append and pid in self.preview_sessions:
+            sess = self.preview_sessions[pid]
+            sess["status"] = "running"
+        else:
+            self.preview_sessions[pid] = {
+                "preview_id": pid,
+                "items": [],
+                "by_id": {},
+                "meta": None,
+                "status": "running",
+            }
         task = asyncio.create_task(
             self._run_preview(
                 preview_id=pid,
@@ -717,6 +889,9 @@ class DesktopRuntime:
                 start_time=(start_time or "").strip(),
                 end_time=(end_time or "").strip(),
                 increase=increase,
+                scope=scope,
+                append=append,
+                auto_download=auto_download,
             )
         )
         self.preview_tasks[pid] = task
@@ -740,6 +915,9 @@ class DesktopRuntime:
         start_time: str,
         end_time: str,
         increase: Optional[bool],
+        scope: Optional[str] = None,
+        append: bool = False,
+        auto_download: bool = False,
     ) -> None:
         overrides: Dict[str, Any] = {}
         if sec_uid:
@@ -756,13 +934,25 @@ class DesktopRuntime:
         cm.set_cookies(cfg.get_cookies())
         service = PreviewService(cfg, cm, page_bridge=self.page_bridge)
         session_store = self.preview_sessions[preview_id]
+        newly_added_ids: List[str] = []
+        insert_pos = 0
 
         async def _on_item(item: PreviewItem) -> None:
-            session_store["items"].append(item)
+            nonlocal insert_pos
+            if append:
+                session_store["items"] = [
+                    existing for existing in session_store["items"] if existing.aweme_id != item.aweme_id
+                ]
+                session_store["items"].insert(insert_pos, item)
+                insert_pos += 1
+            else:
+                session_store["items"].append(item)
             session_store["by_id"][item.aweme_id] = item
+            if item.aweme_id not in newly_added_ids:
+                newly_added_ids.append(item.aweme_id)
             await self.event_bus.publish(
                 "preview_item",
-                {"preview_id": preview_id, "item": item.to_summary_dict()},
+                {"preview_id": preview_id, "item": item.to_summary_dict(), "append": append},
             )
 
         try:
@@ -811,16 +1001,22 @@ class DesktopRuntime:
                 await self._record_parse_history(raw_url, resolved, parsed, result, service)
 
             session_store["status"] = "done"
+            if scope in self._workspace_ids or preview_id in self._workspace_ids.values():
+                self._save_preview_workspace()
+            if auto_download and newly_added_ids:
+                self.submit_download_job(preview_id=preview_id, aweme_ids=newly_added_ids)
             await self.event_bus.publish(
                 "preview_done",
                 {
                     "preview_id": preview_id,
-                    "total": len(session_store["items"]),
+                    "total": len(newly_added_ids) if append else len(session_store["items"]),
                     "meta": meta_summary,
                 },
             )
         except asyncio.CancelledError:
             session_store["status"] = "cancelled"
+            if scope in self._workspace_ids or preview_id in self._workspace_ids.values():
+                self._save_preview_workspace()
             await self.event_bus.publish(
                 "preview_done",
                 {"preview_id": preview_id, "total": len(session_store["items"]), "cancelled": True},
@@ -835,6 +1031,140 @@ class DesktopRuntime:
         finally:
             self.preview_tasks.pop(preview_id, None)
             await service.close()
+
+    def _build_media_helper(self, cfg: ConfigLoader, api_client: DouyinAPIClient) -> UserDownloader:
+        cm = CookieManager(str(self.cookie_path))
+        return UserDownloader(
+            config=cfg,
+            api_client=api_client,
+            file_manager=FileManager(cfg.get("path") or default_download_dir()),
+            cookie_manager=cm,
+            database=None,
+            rate_limiter=RateLimiter(max_per_second=float(cfg.get("rate_limit", 2) or 2)),
+            retry_handler=RetryHandler(max_retries=1),
+            queue_manager=QueueManager(max_workers=1),
+        )
+
+    @staticmethod
+    def _is_aweme_media_expired(raw: Dict[str, Any], helper: UserDownloader) -> bool:
+        if not isinstance(raw, dict) or not raw:
+            return True
+        if raw.get("_kind") in ("live", "live_replay"):
+            return False
+        media_type = helper._detect_media_type(raw)
+        if media_type == "video":
+            candidates = helper._build_video_url_candidates(raw)
+            return (not candidates) or _url_is_expired(candidates[0])
+        if media_type == "gallery":
+            imgs = helper._collect_image_url_candidates(raw)
+            live_urls = helper._collect_image_live_urls(raw)
+            if not imgs and not live_urls:
+                return True
+            if imgs and _url_is_expired(imgs[0][0]):
+                return True
+            if live_urls and _url_is_expired(live_urls[0][1]):
+                return True
+            return False
+        return False
+
+    def _extract_media_payload(
+        self,
+        item: PreviewItem,
+        helper: UserDownloader,
+        cfg: ConfigLoader,
+    ) -> Dict[str, Any]:
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        quality = str(cfg.get("video_quality") or "highest")
+        kind = raw.get("_kind")
+        detected = str(kind) if kind else (helper._detect_media_type(raw) if raw else "")
+
+        video_candidates: List[str] = []
+        slides: List[Dict[str, Any]] = []
+        if detected == "video" and raw:
+            video_candidates = helper._build_video_url_candidates(raw)
+        elif detected == "gallery" and raw:
+            for idx, entry in enumerate(helper._iter_gallery_items(raw), start=1):
+                if not isinstance(entry, dict):
+                    continue
+                img_candidates = helper._image_item_url_candidates(entry)
+                live_url = helper._pick_image_live_url(entry, quality) or ""
+                if not img_candidates and not live_url:
+                    continue
+                slides.append(
+                    {
+                        "index": idx,
+                        "image_url": img_candidates[0] if img_candidates else "",
+                        "image_candidates": img_candidates,
+                        "live_video_url": live_url,
+                        "is_live": bool(live_url),
+                        "width": int(helper._positive_int(entry.get("width") or entry.get("w"))),
+                        "height": int(helper._positive_int(entry.get("height") or entry.get("h"))),
+                    }
+                )
+
+        music = raw.get("music") if isinstance(raw.get("music"), dict) else {}
+        music_url = helper._extract_first_url(music.get("play_url")) or ""
+        music_title = str(music.get("title") or "")
+
+        return {
+            "aweme_id": item.aweme_id,
+            "media_type": item.media_type,
+            "title": item.title,
+            "author_name": item.author_name,
+            "author_avatar_url": item.author_avatar_url,
+            "publish_time": item.publish_time,
+            "like_count": item.like_count,
+            "comment_count": item.comment_count,
+            "collect_count": item.collect_count,
+            "share_count": item.share_count,
+            "resolution": item.resolution,
+            "cover_url": item.cover_url,
+            "video_url": video_candidates[0] if video_candidates else "",
+            "video_candidates": video_candidates,
+            "music_url": music_url,
+            "music_title": music_title,
+            "slides": slides,
+        }
+
+    def _find_preview_item(self, preview_id: str, aweme_id: str) -> Optional[PreviewItem]:
+        sess = self.preview_sessions.get(preview_id)
+        if sess and aweme_id in sess.get("by_id", {}):
+            return sess["by_id"][aweme_id]
+        for s in self.preview_sessions.values():
+            found = (s.get("by_id") or {}).get(aweme_id)
+            if found is not None:
+                return found
+        return None
+
+    async def get_preview_item_media(
+        self,
+        preview_id: str,
+        aweme_id: str,
+        *,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
+        item = self._find_preview_item(preview_id, aweme_id)
+        if item is None:
+            raise KeyError(f"Preview item not found: {aweme_id}")
+
+        cfg = self.build_config_loader()
+        proxy = (cfg.get("proxy") or "").strip() or None
+        async with DouyinAPIClient(cfg.get_cookies(), proxy=proxy, page_bridge=self.page_bridge) as api_client:
+            helper = self._build_media_helper(cfg, api_client)
+            raw = item.raw if isinstance(item.raw, dict) else {}
+            if raw.get("_kind") not in ("live", "live_replay") and (
+                refresh or self._is_aweme_media_expired(raw, helper)
+            ):
+                fresh = await api_client.get_video_detail(aweme_id, suppress_error=True)
+                if fresh:
+                    item.raw = fresh
+                    if not item.cover_url:
+                        fresh_payload = self._extract_media_payload(item, helper, cfg)
+                        if fresh_payload["slides"] and fresh_payload["slides"][0].get("image_url"):
+                            item.cover_url = str(fresh_payload["slides"][0]["image_url"])
+                    if preview_id in self._workspace_ids.values():
+                        self._save_preview_workspace()
+            return self._extract_media_payload(item, helper, cfg)
 
     async def _record_parse_history(
         self,
@@ -1297,6 +1627,13 @@ class DesktopRuntime:
                         job["completed"] = job["success"] + job["failed"] + job["skipped"]
                         self.emit_job_snapshot(job)
                         return
+
+                    if self._is_aweme_media_expired(raw, downloader):
+                        fresh = await api_client.get_video_detail(item.aweme_id, suppress_error=True)
+                        if fresh:
+                            raw = fresh
+                            item.raw = fresh
+                            self._save_preview_workspace()
 
                     mode = self._mode_for_preview_item(item)
                     ok = await downloader._download_aweme_assets(

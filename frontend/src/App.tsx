@@ -18,19 +18,13 @@ import { Sidebar } from './components/Sidebar'
 import { TransferDock } from './components/TransferDock'
 import { LogDrawer } from './components/LogDrawer'
 import { ToastContainer } from './components/ToastContainer'
+import { MediaPreviewModal } from './components/MediaPreviewModal'
 import { DownloadPage } from './pages/DownloadPage'
 import { CreatorPage } from './pages/CreatorPage'
 import { CommentsPage } from './pages/CommentsPage'
 import { TasksPage } from './pages/TasksPage'
 import { HistoryPage } from './pages/HistoryPage'
 import { SettingsPage } from './pages/SettingsPage'
-
-function nextPreviewId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID().replace(/-/g, '').slice(0, 12)
-  }
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
-}
 
 export function App() {
   const [activePage, setActivePage] = useState<PageKey>('download')
@@ -66,6 +60,12 @@ export function App() {
 
   // Comments target
   const [commentsTarget, setCommentsTarget] = useState({ awemeId: '', title: '', author: '' })
+
+  // Interactive media viewer modal
+  const [previewModal, setPreviewModal] = useState<{
+    scope: 'link' | 'creator'
+    awemeId: string
+  } | null>(null)
 
   const pushToast = useCallback(
     (
@@ -112,14 +112,28 @@ export function App() {
   useEffect(() => {
     void (async () => {
       try {
-        const [sett, authRes, taskRes] = await Promise.all([
+        const [sett, authRes, taskRes, wsRes] = await Promise.all([
           api.getSettings(),
           api.getAuthStatus(false),
           api.getTasks(),
+          api.getPreviewWorkspace().catch(() => null),
         ])
         setSettings(sett)
         setAuth(authRes)
         setJobs(taskRes.jobs)
+        if (wsRes?.link) {
+          linkPreviewIdRef.current = wsRes.link.preview_id
+          setLinkPreviewId(wsRes.link.preview_id)
+          setLinkItems(wsRes.link.items || [])
+          setLinkMeta(wsRes.link.meta || null)
+        }
+        if (wsRes?.creator) {
+          creatorPreviewIdRef.current = wsRes.creator.preview_id
+          setCreatorPreviewId(wsRes.creator.preview_id)
+          setCreatorItems(wsRes.creator.items || [])
+          setCreatorMeta(wsRes.creator.meta || null)
+          if (wsRes.creator.url) setCreatorUrl(wsRes.creator.url)
+        }
         if (sett.preferences?.theme) setTheme(sett.preferences.theme)
         if (sett.preferences?.view_mode) setViewMode(sett.preferences.view_mode)
         if (!authRes.has_cookie) {
@@ -157,17 +171,26 @@ export function App() {
         if (d.preview_id === linkPreviewIdRef.current) setLinkMeta(d)
         if (d.preview_id === creatorPreviewIdRef.current) setCreatorMeta(d)
       } else if (type === 'preview_item') {
-        const d = data as { preview_id: string; item: PreviewItem }
+        const d = data as { preview_id: string; item: PreviewItem; append?: boolean }
         if (d.preview_id === linkPreviewIdRef.current) {
-          setLinkItems((prev) => [...prev, d.item])
+          setLinkItems((prev) => {
+            const without = prev.filter((it) => it.aweme_id !== d.item.aweme_id)
+            return d.append ? [d.item, ...without] : [...without, d.item]
+          })
         } else if (d.preview_id === creatorPreviewIdRef.current) {
-          setCreatorItems((prev) => [...prev, d.item])
+          setCreatorItems((prev) => {
+            const without = prev.filter((it) => it.aweme_id !== d.item.aweme_id)
+            return [...without, d.item]
+          })
         }
       } else if (type === 'preview_done') {
         const d = data as { preview_id: string; total: number; cancelled?: boolean }
         if (d.preview_id === linkPreviewIdRef.current) {
           setLinkLoading(false)
           if (!d.cancelled) pushToast('success', '解析完成', `共 ${d.total} 个作品`)
+          void api.getPreviewWorkspace().then((ws) => {
+            if (ws?.link?.items) setLinkItems(ws.link.items)
+          }).catch(() => {})
         }
         if (d.preview_id === creatorPreviewIdRef.current) {
           setCreatorLoading(false)
@@ -246,17 +269,20 @@ export function App() {
     void api.saveSettings({ preferences: { view_mode: mode } })
   }
 
-  const startLinkPreview = async (urls: string[]) => {
-    const pid = nextPreviewId()
+  const startLinkPreview = async (urls: string[], autoDownload = false) => {
+    const pid = linkPreviewIdRef.current || 'ws_link'
     linkPreviewIdRef.current = pid
     setLinkPreviewId(pid)
-    setLinkItems([])
-    setLinkMeta(null)
-    setLinkSelected(new Set())
-    setLinkStatus('准备解析…')
+    setLinkStatus(autoDownload ? '正在解析并准备下载…' : '准备解析…')
     setLinkLoading(true)
     try {
-      await api.startPreview({ preview_id: pid, urls })
+      await api.startPreview({
+        preview_id: pid,
+        scope: 'link',
+        append: true,
+        auto_download: autoDownload,
+        urls,
+      })
     } catch (err) {
       setLinkLoading(false)
       pushToast('error', '启动解析失败', err instanceof Error ? err.message : String(err))
@@ -271,7 +297,7 @@ export function App() {
     end_time: string
     increase: boolean
   }) => {
-    const pid = nextPreviewId()
+    const pid = creatorPreviewIdRef.current || 'ws_creator'
     creatorPreviewIdRef.current = pid
     setCreatorPreviewId(pid)
     setCreatorItems([])
@@ -280,7 +306,12 @@ export function App() {
     setCreatorStatus('正在获取博主资料与作品…')
     setCreatorLoading(true)
     try {
-      await api.startPreview({ preview_id: pid, ...params })
+      await api.startPreview({
+        preview_id: pid,
+        scope: 'creator',
+        append: false,
+        ...params,
+      })
     } catch (err) {
       setCreatorLoading(false)
       pushToast('error', '加载博主作品失败', err instanceof Error ? err.message : String(err))
@@ -300,13 +331,43 @@ export function App() {
     }
   }
 
-  const startQuickDownloadUrls = async (urls: string[]) => {
+  const handleRemoveWorkspaceItem = async (scope: 'link' | 'creator', item: PreviewItem) => {
+    if (scope === 'link') {
+      setLinkItems((prev) => prev.filter((it) => it.aweme_id !== item.aweme_id))
+      setLinkSelected((prev) => {
+        const next = new Set(prev)
+        next.delete(item.aweme_id)
+        return next
+      })
+    } else {
+      setCreatorItems((prev) => prev.filter((it) => it.aweme_id !== item.aweme_id))
+      setCreatorSelected((prev) => {
+        const next = new Set(prev)
+        next.delete(item.aweme_id)
+        return next
+      })
+    }
     try {
-      await api.startDownload({ urls })
-      pushToast('info', '已创建直接下载任务', `共 ${urls.length} 条链接`)
-      setActivePage('tasks')
-    } catch (err) {
-      pushToast('error', '创建下载任务失败', err instanceof Error ? err.message : String(err))
+      await api.removePreviewWorkspaceItem(scope, item.aweme_id)
+    } catch {
+      // ignore
+    }
+  }
+
+  const handleClearWorkspace = async (scope: 'link' | 'creator') => {
+    if (scope === 'link') {
+      setLinkItems([])
+      setLinkMeta(null)
+      setLinkSelected(new Set())
+    } else {
+      setCreatorItems([])
+      setCreatorMeta(null)
+      setCreatorSelected(new Set())
+    }
+    try {
+      await api.clearPreviewWorkspace(scope)
+    } catch {
+      // ignore
     }
   }
 
@@ -353,15 +414,17 @@ export function App() {
               viewMode={viewMode}
               onChangeViewMode={handleViewModeChange}
               itemStatuses={itemStatusMap}
-              onStartPreview={startLinkPreview}
+              onStartPreview={(urls, autoDl) => startLinkPreview(urls, Boolean(autoDl))}
               onCancelPreview={() => linkPreviewId && void api.cancelPreview(linkPreviewId)}
               onStartDownload={(chosen) => startDownloadItems(linkPreviewId, chosen)}
-              onQuickDownloadUrls={startQuickDownloadUrls}
               onJumpToCreator={(url) => {
                 setCreatorUrl(url)
                 setActivePage('creator')
               }}
               onOpenComments={openCommentsForItem}
+              onPreviewItem={(item) => setPreviewModal({ scope: 'link', awemeId: item.aweme_id })}
+              onRemoveItem={(item) => void handleRemoveWorkspaceItem('link', item)}
+              onClearItems={() => void handleClearWorkspace('link')}
               onToast={(k, t, d) => pushToast(k, t, d)}
             />
           )}
@@ -383,6 +446,9 @@ export function App() {
               onCancelPreview={() => creatorPreviewId && void api.cancelPreview(creatorPreviewId)}
               onStartDownload={(chosen) => startDownloadItems(creatorPreviewId, chosen)}
               onOpenComments={openCommentsForItem}
+              onPreviewItem={(item) => setPreviewModal({ scope: 'creator', awemeId: item.aweme_id })}
+              onRemoveItem={(item) => void handleRemoveWorkspaceItem('creator', item)}
+              onClearItems={() => void handleClearWorkspace('creator')}
               onToast={(k, t, d) => pushToast(k, t, d)}
             />
           )}
@@ -435,6 +501,31 @@ export function App() {
         toasts={toasts}
         onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))}
       />
+
+      {previewModal && (
+        <MediaPreviewModal
+          previewId={
+            previewModal.scope === 'link'
+              ? linkPreviewId || 'ws_link'
+              : creatorPreviewId || 'ws_creator'
+          }
+          items={previewModal.scope === 'link' ? linkItems : creatorItems}
+          activeAwemeId={previewModal.awemeId}
+          onSelectAweme={(awemeId) =>
+            setPreviewModal((prev) => (prev ? { ...prev, awemeId } : null))
+          }
+          onClose={() => setPreviewModal(null)}
+          onDownloadItem={(item) =>
+            void startDownloadItems(
+              previewModal.scope === 'link'
+                ? linkPreviewId || 'ws_link'
+                : creatorPreviewId || 'ws_creator',
+              [item]
+            )
+          }
+          onOpenComments={openCommentsForItem}
+        />
+      )}
     </div>
   )
 }

@@ -258,3 +258,47 @@ export interface ToastMessage {
   actionLabel?: string
   onAction?: () => void
 }
+
+export interface PreviewSlide {
+  index: number
+  image_url: string
+  image_candidates: string[]
+  live_video_url: string
+  is_live: boolean
+  width: number
+  height: number
+}
+
+export interface PreviewMediaDetail {
+  aweme_id: string
+  media_type: string
+  title: string
+  author_name: string
+  author_avatar_url: string
+  publish_time: string
+  like_count: number
+  comment_count: number
+  collect_count: number
+  share_count: number
+  resolution: string
+  cover_url: string
+  video_url: string
+  video_candidates: string[]
+  music_url: string
+  music_title: string
+  slides: PreviewSlide[]
+}
+
+export interface PreviewWorkspacePayload {
+  link: {
+    preview_id: string
+    meta: PreviewMeta | null
+    items: PreviewItem[]
+  }
+  creator: {
+    preview_id: string
+    url: string
+    meta: PreviewMeta | null
+    items: PreviewItem[]
+  }
+}

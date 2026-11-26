@@ -331,4 +331,182 @@ def test_wait_for_health_fails_fast_and_bypasses_proxy(monkeypatch):
     )
 
 
+def test_workspace_persistence_media_detail_and_proxy_guard(desktop_client):
+    from core.preview_service import PreviewItem
+    from desktop_server.app import create_app
+    from fastapi.testclient import TestClient
+
+    client, app, root = desktop_client
+    runtime = app.state.runtime
+
+    # 1. Populate ws_link and save to disk
+    sess = runtime.preview_sessions["ws_link"]
+    item = PreviewItem(
+        aweme_id="7712005420173470399",
+        title="持久化实况测试",
+        publish_time="2026-11-26 10:00:00",
+        duration="未知",
+        media_type="图文",
+        author_name="测试作者",
+        author_sec_uid="sec_test",
+        size_text="未知",
+        source_type="单个作品",
+        cover_url="https://p3-sign.douyinpic.com/cover.jpg",
+        raw={
+            "aweme_id": "7712005420173470399",
+            "aweme_type": 68,
+            "desc": "持久化实况测试",
+            "music": {"title": "测试背景乐", "play_url": {"url_list": ["https://sf3-cdn-tos.douyinstatic.com/bgm.mp3"]}},
+            "images": [
+                {
+                    "width": 1080,
+                    "height": 1440,
+                    "url_list": ["https://p3-sign.douyinpic.com/still_1.jpg"],
+                    "video": {"play_addr": {"url_list": ["https://v3-web.douyinvod.com/live_1.mp4"]}},
+                },
+                {
+                    "width": 1080,
+                    "height": 1440,
+                    "url_list": ["https://p3-sign.douyinpic.com/still_2.jpg"],
+                },
+            ],
+        },
+    )
+    sess["items"] = [item]
+    sess["by_id"] = {item.aweme_id: item}
+    runtime._save_preview_workspace()
+    assert runtime.workspace_cache_path.exists()
+
+    # 2. Verify media detail endpoint extracts slides + live video + BGM without network refresh
+    media_resp = client.get("/api/preview/ws_link/item/7712005420173470399/media")
+    assert media_resp.status_code == 200
+    payload = media_resp.json()
+    assert payload["aweme_id"] == "7712005420173470399"
+    assert len(payload["slides"]) == 2
+    assert payload["slides"][0]["is_live"] is True
+    assert payload["slides"][0]["live_video_url"] == "https://v3-web.douyinvod.com/live_1.mp4"
+    assert payload["slides"][1]["is_live"] is False
+    assert payload["music_title"] == "测试背景乐"
+    assert "bgm.mp3" in payload["music_url"]
+
+    # 3. Proxy guard rejects non-Douyin hosts
+    bad_proxy = client.get("/api/proxy/media", params={"url": "https://evil.example.com/x.mp4"})
+    assert bad_proxy.status_code == 403
+
+    # 4. Restart a fresh app against the same root and verify workspace restored
+    app2 = create_app(root)
+    with TestClient(app2) as client2:
+        ws_resp = client2.get("/api/preview/workspace")
+        assert ws_resp.status_code == 200
+        ws_data = ws_resp.json()
+        assert len(ws_data["link"]["items"]) == 1
+        assert ws_data["link"]["items"][0]["aweme_id"] == "7712005420173470399"
+        # Media detail still works immediately after restart!
+        media2 = client2.get("/api/preview/ws_link/item/7712005420173470399/media")
+        assert media2.status_code == 200
+        assert len(media2.json()["slides"]) == 2
+
+        # 5. Remove item & clear workspace endpoints
+        rm_resp = client2.delete("/api/preview/workspace/link/item/7712005420173470399")
+        assert rm_resp.status_code == 200 and rm_resp.json()["removed"] is True
+        assert client2.get("/api/preview/workspace").json()["link"]["items"] == []
+
+        clr_resp = client2.delete("/api/preview/workspace/creator")
+        assert clr_resp.status_code == 200 and clr_resp.json()["cleared"] is True
+
+
+def test_start_preview_append_and_auto_download(desktop_client, monkeypatch):
+    import asyncio
+    from core.preview_service import PreviewItem, PreviewResult, PreviewService
+
+    client, app, _root = desktop_client
+    runtime = app.state.runtime
+
+    existing = PreviewItem(
+        aweme_id="100",
+        title="已存在作品",
+        publish_time="2026-11-25 10:00:00",
+        duration="00:10",
+        media_type="视频",
+        author_name="作者A",
+        author_sec_uid="secA",
+        size_text="1 MB",
+        source_type="单个作品",
+        raw={"aweme_id": "100"},
+    )
+    runtime.preview_sessions["ws_link"]["items"] = [existing]
+    runtime.preview_sessions["ws_link"]["by_id"] = {"100": existing}
+
+    new_item = PreviewItem(
+        aweme_id="200",
+        title="新解析实况",
+        publish_time="2026-11-26 10:00:00",
+        duration="未知",
+        media_type="图文",
+        author_name="作者B",
+        author_sec_uid="secB",
+        size_text="未知",
+        source_type="单个作品",
+        raw={"aweme_id": "200", "aweme_type": 68},
+    )
+
+    async def _fake_classify(self, url):
+        return url, {"type": "gallery", "aweme_id": "200"}
+
+    async def _fake_preview(self, url, mode="post", *, on_item=None):
+        if on_item:
+            res = on_item(new_item)
+            if asyncio.iscoroutine(res):
+                await res
+        return PreviewResult(
+            source=url,
+            source_type="gallery",
+            author_name="作者B",
+            items=[new_item],
+            url_type="gallery",
+        )
+
+    monkeypatch.setattr(PreviewService, "classify_url", _fake_classify)
+    monkeypatch.setattr(PreviewService, "preview_url", _fake_preview)
+
+    submitted = []
+    orig_submit = runtime.submit_download_job
+
+    def _spy_submit(*, preview_id=None, aweme_ids=None, **kwargs):
+        submitted.append((preview_id, list(aweme_ids or [])))
+        return {"job_id": "j_auto", "total": len(aweme_ids or [])}
+
+    monkeypatch.setattr(runtime, "submit_download_job", _spy_submit)
+    try:
+        resp = client.post(
+            "/api/preview/start",
+            json={
+                "preview_id": "ws_link",
+                "scope": "link",
+                "append": True,
+                "auto_download": True,
+                "urls": ["https://www.douyin.com/note/200"],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["preview_id"] == "ws_link"
+
+        import time
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            status_resp = client.get("/api/preview/ws_link")
+            if status_resp.status_code == 200 and status_resp.json().get("status") == "done":
+                break
+            time.sleep(0.05)
+    finally:
+        monkeypatch.setattr(runtime, "submit_download_job", orig_submit)
+
+    items = runtime.preview_sessions["ws_link"]["items"]
+    assert [it.aweme_id for it in items] == ["200", "100"]
+    assert submitted == [("ws_link", ["200"])]
+
+
+
+
 

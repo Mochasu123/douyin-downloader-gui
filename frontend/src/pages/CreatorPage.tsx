@@ -34,6 +34,9 @@ interface CreatorPageProps {
   onCancelPreview: () => void
   onStartDownload: (items: PreviewItem[]) => void
   onOpenComments: (item: PreviewItem) => void
+  onPreviewItem: (item: PreviewItem) => void
+  onRemoveItem: (item: PreviewItem) => void
+  onClearItems: () => void
   onToast: (kind: 'info' | 'success' | 'warning' | 'error', title: string, detail?: string) => void
 }
 
@@ -62,6 +65,9 @@ export const CreatorPage: React.FC<CreatorPageProps> = ({
   onCancelPreview,
   onStartDownload,
   onOpenComments,
+  onPreviewItem,
+  onRemoveItem,
+  onClearItems,
   onToast,
 }) => {
   const [mode, setMode] = useState('post')
@@ -321,6 +327,9 @@ export const CreatorPage: React.FC<CreatorPageProps> = ({
         onChangeViewMode={onChangeViewMode}
         onDownloadSelected={onStartDownload}
         onOpenComments={onOpenComments}
+        onPreviewItem={onPreviewItem}
+        onRemoveItem={onRemoveItem}
+        onClearItems={onClearItems}
         itemStatuses={itemStatuses}
         loading={previewLoading}
         emptyHint="输入博主主页链接或点击「我的主页 (self)」，然后点击「加载作品」"
