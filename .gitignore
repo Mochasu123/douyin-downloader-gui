@@ -54,6 +54,7 @@ desktop_self_test.*
 # Frontend build artifacts
 frontend/node_modules/
 frontend/dist/
+*.tsbuildinfo
 
 # Editor / IDE local settings
 .claude/
