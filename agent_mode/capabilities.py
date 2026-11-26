@@ -30,6 +30,8 @@ GATED_ENDPOINTS = frozenset(
         "/aweme/v1/web/music/aweme/",
         "/aweme/v1/web/collects/list/",
         "/aweme/v1/web/collects/video/list/",
+        "/aweme/v1/web/comment/list/",
+        "/aweme/v1/web/comment/list/reply/",
     }
 )
 

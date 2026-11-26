@@ -507,6 +507,195 @@ def test_start_preview_append_and_auto_download(desktop_client, monkeypatch):
     assert submitted == [("ws_link", ["200"])]
 
 
+def test_history_get_and_delete_recursive_live_subfolders(desktop_client):
+    client, app, root = desktop_client
+    runtime = app.state.runtime
+
+    author_dir = root / "Downloaded" / "Eros"
+    merged_dir = author_dir / "合成动图"
+    raw_dir = author_dir / "实况素材"
+    merged_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
+
+    # Target work A (aweme_id=7712005420173470331) has files in root + nested live folders
+    target_id = "7712005420173470331"
+    a_static = author_dir / f"2026-11-26_work_{target_id}_1.jpg"
+    a_music = author_dir / f"2026-11-26_work_{target_id}_music.mp3"
+    a_merged = merged_dir / f"2026-11-26_work_{target_id}_live_1.jpg"
+    a_raw_img = raw_dir / f"2026-11-26_work_{target_id}_live_1.jpg"
+    a_raw_vid = raw_dir / f"2026-11-26_work_{target_id}_live_1.mp4"
+    for f in (a_static, a_music, a_merged, a_raw_img, a_raw_vid):
+        f.write_bytes(b"data")
+
+    # Sibling work B in same author directory + same subfolders must remain untouched
+    sibling_id = "7719999999999999999"
+    b_merged = merged_dir / f"2026-11-26_other_{sibling_id}_live_1.jpg"
+    b_raw_vid = raw_dir / f"2026-11-26_other_{sibling_id}_live_1.mp4"
+    b_merged.write_bytes(b"keep")
+    b_raw_vid.write_bytes(b"keep")
+
+    # Work C whose files should be kept when delete_files=False
+    keep_id = "7720000000000000001"
+    c_dir = root / "Downloaded" / "AnotherAuthor"
+    c_dir.mkdir(parents=True)
+    c_vid = c_dir / f"2026-11-26_keep_{keep_id}.mp4"
+    c_vid.write_bytes(b"video")
+
+    async def _seed():
+        await runtime.db.add_aweme(
+            {
+                "aweme_id": target_id,
+                "aweme_type": "gallery",
+                "title": "实况图文A",
+                "author_id": "u_eros",
+                "author_name": "Eros",
+                "author_sec_uid": "sec_eros",
+                "create_time": 1700000100,
+                "file_path": str(author_dir),
+                "metadata": "{}",
+            }
+        )
+        await runtime.db.add_aweme(
+            {
+                "aweme_id": sibling_id,
+                "aweme_type": "gallery",
+                "title": "实况图文B",
+                "author_id": "u_eros",
+                "author_name": "Eros",
+                "author_sec_uid": "sec_eros",
+                "create_time": 1700000200,
+                "file_path": str(author_dir),
+                "metadata": "{}",
+            }
+        )
+        await runtime.db.add_aweme(
+            {
+                "aweme_id": keep_id,
+                "aweme_type": "video",
+                "title": "视频C",
+                "author_id": "u_c",
+                "author_name": "AnotherAuthor",
+                "author_sec_uid": "sec_c",
+                "create_time": 1700000300,
+                "file_path": str(c_dir),
+                "metadata": "{}",
+            }
+        )
+
+    asyncio.run(_seed())
+
+    hist = client.get("/api/history").json()
+    by_id = {it["aweme_id"]: it for it in hist["items"]}
+    assert by_id[target_id]["file_exists"] is True
+    assert by_id[target_id]["local_file_count"] == 5
+    assert "合成动图" in by_id[target_id]["primary_file"]
+
+    # 1. Delete keep_id with delete_files=False -> DB deleted, file kept
+    del_keep = client.request(
+        "DELETE", "/api/history", json={"aweme_ids": [keep_id], "delete_files": False}
+    )
+    assert del_keep.status_code == 200
+    assert del_keep.json()["deleted"] == 1
+    assert del_keep.json()["deleted_files"] == 0
+    assert c_vid.exists()
+
+    # 2. Delete target_id with delete_files=True -> all 5 files removed, sibling_id untouched
+    del_target = client.request(
+        "DELETE", "/api/history", json={"aweme_ids": [target_id], "delete_files": True}
+    )
+    assert del_target.status_code == 200
+    assert del_target.json()["deleted"] == 1
+    assert del_target.json()["deleted_files"] == 5
+    for f in (a_static, a_music, a_merged, a_raw_img, a_raw_vid):
+        assert not f.exists()
+    assert b_merged.exists()
+    assert b_raw_vid.exists()
+
+    # 3. Delete sibling_id with delete_files=True -> files removed AND empty subfolders cleaned up
+    del_sib = client.request(
+        "DELETE", "/api/history", json={"aweme_ids": [sibling_id], "delete_files": True}
+    )
+    assert del_sib.status_code == 200
+    assert del_sib.json()["deleted_files"] == 2
+    assert not b_merged.exists()
+    assert not b_raw_vid.exists()
+    assert not merged_dir.exists()
+    assert not raw_dir.exists()
+
+
+def test_load_comments_unpacks_fetch_result_and_replies(desktop_client, monkeypatch):
+    from core.comments_collector import CommentsCollector, CommentsFetchResult
+
+    client, app, _root = desktop_client
+    runtime = app.state.runtime
+
+    async def _fake_collect_success(self, aweme_id):
+        return CommentsFetchResult(
+            comments=[
+                {
+                    "cid": "c1",
+                    "text": "主评论测试",
+                    "digg_count": 12,
+                    "create_time": 1700000000,
+                    "ip_label": "广东",
+                    "reply_comment_total": 1,
+                    "user": {"nickname": "用户甲"},
+                    "image_list": [
+                        {
+                            "origin_url": {"url_list": ["https://p9-pc-sign.douyinpic.com/a.jpg"]},
+                            "thumb_url": {"url_list": ["https://p9-pc-sign.douyinpic.com/a_thumb.jpg"]},
+                        }
+                    ],
+                    "_replies": [
+                        {
+                            "cid": "r1",
+                            "text": "二级回复测试",
+                            "digg_count": 3,
+                            "create_time": 1700000010,
+                            "ip_label": "四川",
+                            "user": {"nickname": "回复者乙"},
+                            "image_list": [
+                                {
+                                    "origin_url": {"url_list": ["https://p9-pc-sign.douyinpic.com/r.jpg"]},
+                                    "thumb_url": {"url_list": ["https://p9-pc-sign.douyinpic.com/r_thumb.jpg"]},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            complete=True,
+        )
+
+    monkeypatch.setattr(CommentsCollector, "collect", _fake_collect_success)
+    ok_resp = client.post(
+        "/api/comments/load",
+        json={"aweme_id": "7712005420173470331", "include_replies": True},
+    )
+    assert ok_resp.status_code == 200
+    body = ok_resp.json()
+    assert body["total_comments"] == 1
+    assert body["total_images"] == 2
+    assert body["comments"][0]["replies"][0]["nickname"] == "回复者乙"
+    img_by_key = {img["key"]: img for img in body["images"]}
+    assert img_by_key["r1_0"]["nickname"] == "回复者乙"
+
+    # Empty failed result raises HTTP 502 rather than silently returning 0 comments
+    monkeypatch.setattr("desktop_server.state.asyncio.sleep", AsyncMock(return_value=None))
+
+    async def _fake_collect_fail(self, aweme_id):
+        return CommentsFetchResult(comments=[], complete=False, error="empty response (likely anti-bot)")
+
+    monkeypatch.setattr(CommentsCollector, "collect", _fake_collect_fail)
+    fail_resp = client.post(
+        "/api/comments/load",
+        json={"aweme_id": "7712005420173470331", "include_replies": False},
+    )
+    assert fail_resp.status_code == 502
+    assert "anti-bot" in fail_resp.json()["detail"]
+
+
+
 
 
 

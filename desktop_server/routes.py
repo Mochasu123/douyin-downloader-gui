@@ -60,6 +60,169 @@ def _is_allowed_image_url(url: str) -> bool:
     return any(host == suffix or host.endswith("." + suffix) for suffix in _ALLOWED_IMAGE_HOST_SUFFIXES)
 
 
+def _find_aweme_local_files(base_path: Path, aweme_id: str) -> List[Path]:
+    """Find local media/metadata files belonging to ``aweme_id`` under ``base_path``."""
+    if not base_path.exists():
+        return []
+    if base_path.is_file():
+        return [base_path]
+    if not base_path.is_dir():
+        return []
+
+    found: Dict[Path, Path] = {}
+
+    def _add(file_path: Path) -> None:
+        if file_path.is_file():
+            try:
+                key = file_path.resolve()
+            except OSError:
+                key = file_path
+            found[key] = file_path
+
+    aid = str(aweme_id or "").strip()
+    if aid and aid in base_path.name:
+        for f in base_path.rglob("*"):
+            _add(f)
+        return sorted(found.values(), key=lambda p: str(p))
+
+    if not aid:
+        return []
+
+    for sub in base_path.rglob("*"):
+        if sub.is_dir() and aid in sub.name:
+            for f in sub.rglob("*"):
+                _add(f)
+    for f in base_path.rglob(f"*{aid}*"):
+        _add(f)
+    return sorted(found.values(), key=lambda p: str(p))
+
+
+def _pick_primary_aweme_file(files: List[Path], aweme_type: str, fallback: Path) -> str:
+    """Choose the best representative local file for quick-open/reveal actions."""
+    if not files:
+        return ""
+    is_gallery = aweme_type == "gallery"
+    media_exts = (
+        (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mp3")
+        if is_gallery
+        else (".mp4", ".jpg", ".jpeg", ".png", ".webp", ".mp3")
+    )
+    if is_gallery:
+        merged_images = [
+            f
+            for f in files
+            if "合成动图" in f.parts and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+        ]
+        if merged_images:
+            return str(merged_images[0])
+    for ext in media_exts:
+        matches = [f for f in files if f.suffix.lower() == ext]
+        if matches:
+            return str(matches[0])
+    return str(files[0] if files else fallback)
+
+
+def _protected_download_roots(runtime: DesktopRuntime) -> set[Path]:
+    roots: set[Path] = set()
+    candidates = [runtime.project_root]
+    try:
+        cfg = runtime.build_config_loader()
+        dl_path = str(cfg.get("path") or default_download_dir()).strip()
+        if dl_path:
+            p = Path(dl_path)
+            if not p.is_absolute():
+                p = runtime.project_root / p
+            candidates.append(p)
+    except Exception:
+        pass
+    for c in candidates:
+        try:
+            resolved = c.resolve()
+            roots.add(resolved)
+            if resolved.parent:
+                roots.add(resolved.parent)
+        except OSError:
+            pass
+    return roots
+
+
+def _delete_aweme_local_files(
+    base_path: Path, aweme_id: str, protected_roots: set[Path]
+) -> int:
+    """Delete local files for ``aweme_id`` safely, including nested subfolders."""
+    if not base_path.exists():
+        return 0
+    try:
+        resolved_base = base_path.resolve()
+    except OSError:
+        resolved_base = base_path
+
+    if resolved_base == resolved_base.parent:
+        return 0
+    if base_path.is_file():
+        base_path.unlink(missing_ok=True)
+        return 1
+    if not base_path.is_dir():
+        return 0
+
+    aid = str(aweme_id or "").strip()
+    deleted_count = 0
+
+    if aid and aid in base_path.name and resolved_base not in protected_roots:
+        deleted_count = sum(1 for f in base_path.rglob("*") if f.is_file())
+        shutil.rmtree(base_path, ignore_errors=True)
+        return deleted_count
+
+    if not aid:
+        return 0
+
+    # 1. Remove any dedicated subfolder matching *{aweme_id}* (deepest first)
+    matching_dirs = sorted(
+        (d for d in base_path.rglob("*") if d.is_dir() and aid in d.name),
+        key=lambda d: len(d.parts),
+        reverse=True,
+    )
+    for d in matching_dirs:
+        if not d.exists():
+            continue
+        try:
+            if d.resolve() in protected_roots:
+                continue
+        except OSError:
+            continue
+        deleted_count += sum(1 for f in d.rglob("*") if f.is_file())
+        shutil.rmtree(d, ignore_errors=True)
+
+    # 2. Remove any files referencing *{aweme_id}* across root and subfolders (实况素材 / 合成动图 / etc.)
+    for f in list(base_path.rglob(f"*{aid}*")):
+        if f.is_file():
+            f.unlink(missing_ok=True)
+            deleted_count += 1
+
+    # 3. Clean up empty subdirectories bottom-up
+    all_dirs = sorted(
+        (d for d in base_path.rglob("*") if d.is_dir()),
+        key=lambda d: len(d.parts),
+        reverse=True,
+    )
+    for d in all_dirs:
+        try:
+            if not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+
+    # 4. Remove base_path only if it is now completely empty and not a protected root
+    if resolved_base not in protected_roots:
+        try:
+            if base_path.exists() and not any(base_path.iterdir()):
+                base_path.rmdir()
+        except OSError:
+            pass
+
+    return deleted_count
+
+
 class CookiePayload(BaseModel):
     cookie: str
 
@@ -434,22 +597,19 @@ def build_router(runtime: DesktopRuntime) -> APIRouter:
         for item in items:
             fp = item.get("file_path") or ""
             p = Path(fp) if fp else None
-            exists = bool(p and p.exists())
-            item["file_exists"] = exists
-            # Pick best media file inside directory if file_path is a folder
+            aid = str(item.get("aweme_id") or "")
+            aweme_type = str(item.get("aweme_type") or "")
             primary_file = ""
-            if exists and p is not None:
-                if p.is_file():
-                    primary_file = str(p)
-                else:
-                    aid = str(item.get("aweme_id") or "")
-                    for ext in (".mp4", ".jpg", ".jpeg", ".png", ".webp", ".mp3"):
-                        matches = list(p.glob(f"*{aid}*{ext}")) if aid else []
-                        if matches:
-                            primary_file = str(matches[0])
-                            break
-                    if not primary_file:
-                        primary_file = str(p)
+            local_file_count = 0
+            exists = False
+            if p is not None and p.exists():
+                matched = _find_aweme_local_files(p, aid)
+                local_file_count = len(matched)
+                exists = local_file_count > 0
+                if matched:
+                    primary_file = _pick_primary_aweme_file(matched, aweme_type, p)
+            item["file_exists"] = exists
+            item["local_file_count"] = local_file_count
             item["primary_file"] = primary_file
             covers = item.get("cover_urls") or []
             item["cover_url"] = covers[0] if covers else ""
@@ -473,8 +633,10 @@ def build_router(runtime: DesktopRuntime) -> APIRouter:
     @router.delete("/api/history")
     async def delete_history(payload: DeleteHistoryPayload) -> Dict[str, Any]:
         if runtime.db is None or not payload.aweme_ids:
-            return {"deleted": 0}
+            return {"deleted": 0, "deleted_files": 0}
+        deleted_files = 0
         if payload.delete_files:
+            protected = _protected_download_roots(runtime)
             # Look up paths before deleting
             for aid in payload.aweme_ids:
                 try:
@@ -483,20 +645,13 @@ def build_router(runtime: DesktopRuntime) -> APIRouter:
                     )
                     row = await cursor.fetchone()
                     if row and row[0]:
-                        p = Path(row[0])
-                        if p.is_file():
-                            p.unlink(missing_ok=True)
-                        elif p.is_dir():
-                            # Only remove files referencing this aweme_id or empty folder
-                            for f in list(p.glob(f"*{aid}*")):
-                                if f.is_file():
-                                    f.unlink(missing_ok=True)
-                            if not any(p.iterdir()):
-                                shutil.rmtree(p, ignore_errors=True)
+                        deleted_files += _delete_aweme_local_files(
+                            Path(row[0]), str(aid), protected
+                        )
                 except Exception:
                     pass
         deleted = await runtime.db.delete_aweme_by_ids(payload.aweme_ids)
-        return {"deleted": deleted}
+        return {"deleted": deleted, "deleted_files": deleted_files}
 
     # ── Image Proxy & Local Avatar ──────────────────────────────────────
 

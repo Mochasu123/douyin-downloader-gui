@@ -149,6 +149,8 @@ export const api = {
       images: CommentImageEntry[]
       total_comments: number
       total_images: number
+      complete?: boolean
+      warning?: string
     }>('/api/comments/load', { method: 'POST', body: JSON.stringify(payload) }),
   downloadCommentImages: (payload: { aweme_id: string; keys: string[]; save_dir: string }) =>
     request<{ success: number; failed: number; save_dir: string }>('/api/comments/download-images', {
@@ -203,7 +205,7 @@ export const api = {
   },
   getHistoryStats: () => request<HistoryStats>('/api/history/stats'),
   deleteHistory: (aweme_ids: string[], delete_files = false) =>
-    request<{ deleted: number }>('/api/history', {
+    request<{ deleted: number; deleted_files?: number }>('/api/history', {
       method: 'DELETE',
       body: JSON.stringify({ aweme_ids, delete_files }),
     }),

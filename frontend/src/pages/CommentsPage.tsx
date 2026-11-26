@@ -83,7 +83,15 @@ export const CommentsPage: React.FC<CommentsPageProps> = ({
         const sep = base.includes('\\') ? '\\' : '/'
         setSaveDir(`${base.replace(/[\\/]+$/, '')}${sep}评论图片${sep}${res.aweme_id}`)
       }
-      onToast('success', `加载完成`, `共 ${res.total_comments} 条评论，${res.total_images} 张图片`)
+      if (res.warning) {
+        onToast(
+          'warning',
+          '部分评论加载完成',
+          `共 ${res.total_comments} 条评论，${res.total_images} 张图片（${res.warning}）`
+        )
+      } else {
+        onToast('success', `加载完成`, `共 ${res.total_comments} 条评论，${res.total_images} 张图片`)
+      }
     } catch (err) {
       onToast('error', '评论加载失败', err instanceof Error ? err.message : String(err))
     } finally {
@@ -93,14 +101,15 @@ export const CommentsPage: React.FC<CommentsPageProps> = ({
 
   const filteredComments = useMemo(() => {
     const q = search.trim().toLowerCase()
+    const matchesQuery = (entry: CommentEntry) =>
+      entry.text.toLowerCase().includes(q) ||
+      entry.nickname.toLowerCase().includes(q) ||
+      entry.ip_label.toLowerCase().includes(q)
     const list = comments.filter((c) => {
-      if (onlyImages && c.image_count === 0) return false
+      const hasImages = c.image_count > 0 || Boolean(c.replies?.some((r) => r.image_count > 0))
+      if (onlyImages && !hasImages) return false
       if (!q) return true
-      return (
-        c.text.toLowerCase().includes(q) ||
-        c.nickname.toLowerCase().includes(q) ||
-        c.ip_label.toLowerCase().includes(q)
-      )
+      return matchesQuery(c) || Boolean(c.replies?.some(matchesQuery))
     })
     if (sortBy === 'likes') {
       return [...list].sort((a, b) => b.digg_count - a.digg_count)
@@ -359,6 +368,60 @@ export const CommentsPage: React.FC<CommentsPageProps> = ({
                     {c.time && (
                       <div className="text-[10.5px] tabular-nums" style={{ color: 'var(--text-muted)' }}>
                         {c.time}
+                      </div>
+                    )}
+                    {c.replies && c.replies.length > 0 && (
+                      <div
+                        className="mt-2 pl-3 border-l-2 space-y-2"
+                        style={{ borderColor: 'var(--border-subtle)' }}
+                      >
+                        {c.replies.map((reply) => {
+                          const replyImgs = thumbByComment.get(reply.cid) || []
+                          return (
+                            <div key={reply.cid} className="space-y-1 text-[11.5px]">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-semibold truncate" style={{ color: 'var(--text-secondary)' }}>
+                                  {reply.nickname}
+                                </span>
+                                <div
+                                  className="flex items-center gap-2 text-[10.5px] shrink-0 tabular-nums"
+                                  style={{ color: 'var(--text-muted)' }}
+                                >
+                                  {reply.ip_label && <span>{reply.ip_label}</span>}
+                                  <span className="flex items-center gap-0.5">
+                                    <Heart className="w-2.5 h-2.5" />
+                                    {reply.digg_count}
+                                  </span>
+                                </div>
+                              </div>
+                              {reply.text && <div className="leading-relaxed break-words">{reply.text}</div>}
+                              {replyImgs.length > 0 && (
+                                <div className="flex flex-wrap gap-1.5 pt-0.5">
+                                  {replyImgs.map((img) => (
+                                    <button
+                                      key={img.key}
+                                      onClick={() => jumpToImage(img.key)}
+                                      className="relative w-12 h-12 rounded-lg overflow-hidden border hover:ring-2 hover:ring-[var(--accent)] cursor-pointer"
+                                      style={{ borderColor: 'var(--border-subtle)' }}
+                                    >
+                                      <img
+                                        src={proxyImageUrl(img.preview_url)}
+                                        alt=""
+                                        loading="lazy"
+                                        className="w-full h-full object-cover"
+                                      />
+                                      {img.is_live && (
+                                        <span className="absolute bottom-0.5 right-0.5 px-1 rounded text-[9px] bg-amber-500 text-white font-semibold">
+                                          动图
+                                        </span>
+                                      )}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
                       </div>
                     )}
                   </div>

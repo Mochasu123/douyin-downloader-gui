@@ -127,6 +127,8 @@ export interface CommentEntry {
   text: string
   image_count: number
   live_image_count: number
+  reply_count?: number
+  replies?: CommentEntry[]
 }
 
 export interface CommentImageEntry {
@@ -153,6 +155,7 @@ export interface HistoryItem {
   file_path: string
   primary_file: string
   file_exists: boolean
+  local_file_count?: number
   cover_url: string
   cover_urls: string[]
   job_id: string

@@ -1685,7 +1685,7 @@ class DouyinAPIClient:
                 "rcFT": "",
             }
         )
-        raw = await self._request_json("/aweme/v1/web/comment/list/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/comment/list/", params)
         normalized = self._normalize_paged_response(raw, item_keys=["comments"])
 
         if include_replies:
@@ -1723,7 +1723,7 @@ class DouyinAPIClient:
                 "count": count,
             }
         )
-        raw = await self._request_json("/aweme/v1/web/comment/list/reply/", params)
+        raw = await self._request_json_gated("/aweme/v1/web/comment/list/reply/", params)
         return self._normalize_paged_response(raw, item_keys=["comments"])
 
     async def resolve_short_url(

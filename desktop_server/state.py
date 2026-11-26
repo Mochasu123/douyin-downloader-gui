@@ -1741,6 +1741,55 @@ class DesktopRuntime:
 
     # ── Comments & Comment Gallery ──────────────────────────────────────
 
+    @staticmethod
+    def _format_comment_entry(
+        comment: Dict[str, Any],
+        fallback_cid: str,
+        nickname_map: Dict[str, str],
+    ) -> Dict[str, Any]:
+        cid = str(comment.get("cid") or comment.get("comment_id") or fallback_cid)
+        user = comment.get("user") or {}
+        nick = str(user.get("nickname") or "匿名")
+        nickname_map[cid] = nick
+        ts = 0
+        try:
+            ts = int(comment.get("create_time") or 0)
+        except (TypeError, ValueError):
+            pass
+        time_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts > 0 else ""
+        imgs = collect_all_comment_images([comment])
+        avatar = PreviewService._first_url(user.get("avatar_thumb"))
+        raw_replies = comment.get("_replies")
+        formatted_replies: List[Dict[str, Any]] = []
+        if isinstance(raw_replies, list):
+            for r_idx, reply in enumerate(raw_replies):
+                if isinstance(reply, dict):
+                    formatted_replies.append(
+                        DesktopRuntime._format_comment_entry(
+                            reply, f"{cid}_reply_{r_idx}", nickname_map
+                        )
+                    )
+        try:
+            reply_count = int(comment.get("reply_comment_total") or len(formatted_replies))
+        except (TypeError, ValueError):
+            reply_count = len(formatted_replies)
+        entry: Dict[str, Any] = {
+            "cid": cid,
+            "nickname": nick,
+            "avatar_url": avatar,
+            "time": time_text,
+            "create_time": ts,
+            "ip_label": str(comment.get("ip_label") or ""),
+            "digg_count": int(comment.get("digg_count") or 0),
+            "text": str(comment.get("text") or ""),
+            "image_count": len(imgs),
+            "live_image_count": sum(1 for i in imgs if i.is_live),
+            "reply_count": reply_count,
+        }
+        if formatted_replies:
+            entry["replies"] = formatted_replies
+        return entry
+
     async def load_comments(
         self,
         aweme_id: str,
@@ -1748,11 +1797,15 @@ class DesktopRuntime:
         include_replies: bool = False,
         max_comments: int = 0,
     ) -> Dict[str, Any]:
+        cfg = self.build_config_loader()
+        proxy = (cfg.get("proxy") or "").strip() or None
+        cookies = self.get_cookie_dict()
+
         # Accept URL or bare aweme_id
         clean_id = str(aweme_id or "").strip()
         if clean_id.startswith("http") or "douyin.com" in clean_id:
             extracted = extract_url_from_line(clean_id) or clean_id
-            async with DouyinAPIClient(self.get_cookie_dict()) as client:
+            async with DouyinAPIClient(cookies, proxy=proxy) as client:
                 if is_short_url(extracted):
                     extracted = await client.resolve_short_url(normalize_short_url(extracted)) or extracted
             parsed = URLParser.parse(extracted) or {}
@@ -1761,9 +1814,9 @@ class DesktopRuntime:
         if not clean_id:
             raise ValueError("请输入有效的作品 ID 或链接")
 
-        cfg = self.build_config_loader()
-        proxy = (cfg.get("proxy") or "").strip() or None
-        cookies = self.get_cookie_dict()
+        raw_comments: List[Dict[str, Any]] = []
+        complete = False
+        fetch_error = ""
         async with DouyinAPIClient(cookies, proxy=proxy, page_bridge=self.page_bridge) as api_client:
             collector = CommentsCollector(
                 api_client,
@@ -1772,50 +1825,39 @@ class DesktopRuntime:
                 max_comments=max_comments,
                 rate_limiter=RateLimiter(max_per_second=float(cfg.get("rate_limit", 2) or 2)),
             )
-            comments = None
             for attempt in range(3):
-                comments = await collector.collect(clean_id)
-                if comments is not None:
+                fetch_result = await collector.collect(clean_id)
+                if hasattr(fetch_result, "comments"):
+                    raw_comments = list(fetch_result.comments or [])
+                    complete = bool(getattr(fetch_result, "complete", True))
+                    fetch_error = str(getattr(fetch_result, "error", "") or "")
+                elif isinstance(fetch_result, list):
+                    raw_comments = list(fetch_result)
+                    complete = True
+                    fetch_error = ""
+                else:
+                    raw_comments = []
+                    complete = False
+                    fetch_error = "unexpected collector response"
+                if complete or raw_comments:
                     break
                 if attempt < 2:
-                    await asyncio.sleep(1.5 + attempt * 2)
+                    await asyncio.sleep(1.2 + attempt * 1.5)
 
-        if comments is None:
-            raise RuntimeError("评论加载失败（可能被限流或需要有效 Cookie），请稍后重试")
+        if not complete and not raw_comments:
+            detail = fetch_error or "可能被限流或需要有效 Cookie"
+            raise RuntimeError(f"评论加载失败（{detail}），请稍后重试")
 
         display_comments: List[Dict[str, Any]] = []
         nickname_map: Dict[str, str] = {}
-        for idx, c in enumerate(comments):
+        for idx, c in enumerate(raw_comments):
             if not isinstance(c, dict):
                 continue
-            cid = str(c.get("cid") or c.get("comment_id") or f"no_cid_{idx}")
-            user = c.get("user") or {}
-            nick = str(user.get("nickname") or "匿名")
-            nickname_map[cid] = nick
-            ts = 0
-            try:
-                ts = int(c.get("create_time") or 0)
-            except (TypeError, ValueError):
-                pass
-            time_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts > 0 else ""
-            imgs = collect_all_comment_images([c])
-            avatar = PreviewService._first_url(user.get("avatar_thumb"))
             display_comments.append(
-                {
-                    "cid": cid,
-                    "nickname": nick,
-                    "avatar_url": avatar,
-                    "time": time_text,
-                    "create_time": ts,
-                    "ip_label": str(c.get("ip_label") or ""),
-                    "digg_count": int(c.get("digg_count") or 0),
-                    "text": str(c.get("text") or ""),
-                    "image_count": len(imgs),
-                    "live_image_count": sum(1 for i in imgs if i.is_live),
-                }
+                self._format_comment_entry(c, f"no_cid_{idx}", nickname_map)
             )
 
-        raw_images = collect_all_comment_images(comments)
+        raw_images = collect_all_comment_images(raw_comments)
         image_map: Dict[str, CommentImage] = {}
         image_items: List[Dict[str, Any]] = []
         for img in raw_images:
@@ -1835,6 +1877,7 @@ class DesktopRuntime:
                 }
             )
 
+        warning = "" if complete else (fetch_error or "评论仅加载了部分页面")
         self.comments_cache[clean_id] = {
             "aweme_id": clean_id,
             "comments": display_comments,
@@ -1847,6 +1890,8 @@ class DesktopRuntime:
             "images": image_items,
             "total_comments": len(display_comments),
             "total_images": len(image_items),
+            "complete": complete,
+            "warning": warning,
         }
 
     async def download_comment_images(
