@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import io
 import json
 import os
 import socket
@@ -23,9 +22,9 @@ from typing import Optional
 def _ensure_std_streams() -> None:
     """Guard against None stdout/stderr in PyInstaller --windowed builds."""
     if sys.stdout is None:
-        sys.stdout = io.StringIO()
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
     if sys.stderr is None:
-        sys.stderr = io.StringIO()
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
 _ensure_std_streams()
@@ -118,18 +117,36 @@ class NativeBridge:
     """Functions exposed to the web UI via window.pywebview.api."""
 
     def __init__(self) -> None:
-        self.window = None
+        # Prefix with '_' so pywebview.util.get_functions() skips it instead
+        # of recursing into WinForms/WebView2 GUI properties on a background thread.
+        self._window = None
 
-    def attach_window(self, window) -> None:
-        self.window = window
+    def _attach_window(self, window) -> None:
+        self._window = window
+
+    def _run_on_ui_thread(self, fn):
+        window = self._window
+        if window is None:
+            return None
+        native = getattr(window, "native", None)
+        if native is not None and getattr(native, "InvokeRequired", False):
+            try:
+                from System import Func, Object
+
+                return native.Invoke(Func[Object](lambda: fn()))
+            except Exception:
+                pass
+        return fn()
 
     def pick_directory(self, initial_dir: str = "") -> Optional[str]:
-        if self.window is None:
+        if self._window is None:
             return None
         import webview
 
         target_dir = initial_dir if initial_dir and Path(initial_dir).exists() else str(Path.home())
-        result = self.window.create_file_dialog(webview.FileDialog.FOLDER, directory=target_dir)
+        result = self._run_on_ui_thread(
+            lambda: self._window.create_file_dialog(webview.FileDialog.FOLDER, directory=target_dir)
+        )
         if isinstance(result, (list, tuple)) and result:
             return str(result[0])
         if isinstance(result, str) and result:
@@ -137,15 +154,17 @@ class NativeBridge:
         return None
 
     def save_file_dialog(self, default_name: str = "comments.xlsx") -> Optional[str]:
-        if self.window is None:
+        if self._window is None:
             return None
         import webview
 
-        result = self.window.create_file_dialog(
-            webview.FileDialog.SAVE,
-            directory=str(Path.home() / "Desktop"),
-            save_filename=default_name or "comments.xlsx",
-            file_types=("Excel 工作簿 (*.xlsx)",),
+        result = self._run_on_ui_thread(
+            lambda: self._window.create_file_dialog(
+                webview.FileDialog.SAVE,
+                directory=str(Path.home() / "Desktop"),
+                save_filename=default_name or "comments.xlsx",
+                file_types=("Excel 工作簿 (*.xlsx)",),
+            )
         )
         if isinstance(result, (list, tuple)) and result:
             return str(result[0])
@@ -333,8 +352,9 @@ def _run_desktop_mode() -> int:
         min_size=(980, 640),
         background_color=bg_color,
         text_select=True,
+        easy_drag=False,
     )
-    bridge.attach_window(window)
+    bridge._attach_window(window)
 
     def _on_closing():
         _save_window_geometry(window)

@@ -202,3 +202,30 @@ def test_tasks_download_validation_and_websocket_logs(desktop_client):
         runtime.event_bus.append_log("INFO", "Test", "hello ws")
         msg = ws.receive_json()
         assert msg["type"] in ("logs_snapshot", "log")
+
+
+def test_native_bridge_hides_window_from_pywebview_introspection():
+    import desktop_app
+
+    class ExplodingWindow:
+        @property
+        def width(self):
+            raise AssertionError("pywebview must not introspect window GUI properties")
+
+    bridge = desktop_app.NativeBridge()
+    bridge._attach_window(ExplodingWindow())
+
+    assert not hasattr(bridge, "window")
+    assert not hasattr(bridge, "attach_window")
+
+    public_attrs = {name for name in dir(bridge) if not name.startswith("_")}
+    assert public_attrs == {
+        "pick_directory",
+        "save_file_dialog",
+        "open_path",
+        "reveal_in_explorer",
+        "read_clipboard",
+    }
+    assert all(callable(getattr(bridge, name)) for name in public_attrs)
+    assert bridge._run_on_ui_thread(lambda: "ok") == "ok"
+
