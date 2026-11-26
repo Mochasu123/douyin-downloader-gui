@@ -26,6 +26,7 @@ from core.comments_collector import CommentsCollector
 from core.preview_service import PreviewItem, PreviewService
 from core.user_downloader import UserDownloader
 from desktop_server.events import EventBus, EventBusLogHandler, SpeedTracker
+from desktop_server.page_bridge import DesktopPageBridge, launch_chromium_browser
 from storage import Database, FileManager, MetadataHandler
 from tools.cookie_fetcher import filter_cookies, try_extract_ms_token
 from utils.cookie_utils import parse_cookie_header, sanitize_cookies
@@ -193,6 +194,12 @@ class DesktopRuntime:
         self._login_cancel_event: Optional[asyncio.Event] = None
         self.login_state: Dict[str, Any] = {"status": "idle", "message": ""}
 
+        # Lazy headless browser bridge for ArgusSecurityPlugin-gated endpoints
+        self.page_bridge = DesktopPageBridge(
+            cookie_provider=self.get_cookie_dict,
+            proxy_provider=self._get_proxy,
+        )
+
     async def startup(self) -> None:
         self.event_bus.bind_loop(asyncio.get_running_loop())
         self.thumb_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -237,6 +244,7 @@ class DesktopRuntime:
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
             self.http_session = None
+        await self.page_bridge.close()
         if self.db is not None:
             await self.db.close()
             self.db = None
@@ -339,6 +347,7 @@ class DesktopRuntime:
         elif self.cookie_path.exists():
             self.cookie_path.write_text("{}", encoding="utf-8")
         self._auth_cache = None
+        self.page_bridge.mark_cookies_dirty()
         return parsed
 
     def save_cookie_dict(self, cookies: Dict[str, str]) -> Dict[str, str]:
@@ -346,7 +355,12 @@ class DesktopRuntime:
         cm = CookieManager(str(self.cookie_path))
         cm.set_cookies(cleaned)
         self._auth_cache = None
+        self.page_bridge.mark_cookies_dirty()
         return cleaned
+
+    def _get_proxy(self) -> Optional[str]:
+        proxy = str(self.build_config_loader().get("proxy") or "").strip()
+        return proxy or None
 
     def build_config_loader(self, overrides: Optional[Dict[str, Any]] = None) -> ConfigLoader:
         cfg_arg = str(self.config_path) if self.config_path.exists() else None
@@ -493,7 +507,7 @@ class DesktopRuntime:
         user_payload = None
         logged_in = False
         error_msg = ""
-        async with DouyinAPIClient(cookies, proxy=proxy) as client:
+        async with DouyinAPIClient(cookies, proxy=proxy, page_bridge=self.page_bridge) as client:
             try:
                 info = await client.get_self_info()
                 if isinstance(info, dict) and (info.get("uid") or info.get("sec_uid")):
@@ -567,7 +581,9 @@ class DesktopRuntime:
         context = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=False)
+                browser = await launch_chromium_browser(
+                    p, headless=False, proxy=self._get_proxy()
+                )
                 context = await browser.new_context()
                 page = await context.new_page()
                 observed_headers: List[str] = []
@@ -737,7 +753,7 @@ class DesktopRuntime:
         cfg = self.build_config_loader(overrides=overrides)
         cm = CookieManager(str(self.cookie_path))
         cm.set_cookies(cfg.get_cookies())
-        service = PreviewService(cfg, cm)
+        service = PreviewService(cfg, cm, page_bridge=self.page_bridge)
         session_store = self.preview_sessions[preview_id]
 
         async def _on_item(item: PreviewItem) -> None:
@@ -1117,7 +1133,9 @@ class DesktopRuntime:
             queue_manager = QueueManager(max_workers=threads)
             file_manager = FileManager(cfg.get("path") or default_download_dir())
 
-            api_client = DouyinAPIClient(cfg.get_cookies(), proxy=proxy)
+            api_client = DouyinAPIClient(
+                cfg.get_cookies(), proxy=proxy, page_bridge=self.page_bridge
+            )
             try:
                 if job["source_kind"] == "items":
                     await self._run_items_job(
@@ -1408,7 +1426,7 @@ class DesktopRuntime:
         cfg = self.build_config_loader()
         proxy = (cfg.get("proxy") or "").strip() or None
         cookies = self.get_cookie_dict()
-        async with DouyinAPIClient(cookies, proxy=proxy) as api_client:
+        async with DouyinAPIClient(cookies, proxy=proxy, page_bridge=self.page_bridge) as api_client:
             collector = CommentsCollector(
                 api_client,
                 MetadataHandler(),

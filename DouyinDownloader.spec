@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('C:\\Workspace\\CodeApply\\douyin-downloader\\frontend\\dist', 'frontend/dist'), ('C:\\Workspace\\CodeApply\\douyin-downloader\\img', 'img'), ('C:\\Workspace\\CodeApply\\douyin-downloader\\config.example.yml', '.')]
 binaries = [('C:\\Users\\whoca\\anaconda3\\Library\\bin\\sqlite3.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\libbz2.dll', '.'), ('C:\\Users\\whoca\\anaconda3\\Library\\bin\\ffi.dll', '.')]
-hiddenimports = ['cli.main', 'core', 'core.preview_service', 'core.comment_media', 'core.comment_export', 'core.live_photo', 'auth', 'config', 'control', 'storage', 'utils', 'tools', 'server', 'desktop_server', 'desktop_server.app', 'desktop_server.routes', 'desktop_server.state', 'desktop_server.events', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on']
+hiddenimports = ['cli.main', 'core', 'core.preview_service', 'core.comment_media', 'core.comment_export', 'core.live_photo', 'auth', 'config', 'control', 'storage', 'utils', 'tools', 'server', 'desktop_server', 'desktop_server.app', 'desktop_server.routes', 'desktop_server.state', 'desktop_server.events', 'desktop_server.page_bridge', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on']
 tmp_ret = collect_all('aiohttp')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('aiosqlite')

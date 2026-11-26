@@ -92,6 +92,7 @@ foreach ($Dll in @("sqlite3.dll", "libbz2.dll", "ffi.dll")) {
     --hidden-import desktop_server.routes `
     --hidden-import desktop_server.state `
     --hidden-import desktop_server.events `
+    --hidden-import desktop_server.page_bridge `
     --hidden-import uvicorn.logging `
     --hidden-import uvicorn.loops.auto `
     --hidden-import uvicorn.protocols.http.auto `

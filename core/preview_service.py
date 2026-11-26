@@ -72,12 +72,19 @@ OnItemCallback = Optional[Callable[[PreviewItem], Awaitable[None] | None]]
 
 
 class PreviewService:
-    def __init__(self, config: ConfigLoader, cookie_manager: CookieManager):
+    def __init__(
+        self,
+        config: ConfigLoader,
+        cookie_manager: CookieManager,
+        *,
+        page_bridge: Optional[Any] = None,
+    ):
         self.config = config
         self.cookie_manager = cookie_manager
         self.api_client = DouyinAPIClient(
             config.get_cookies(),
             proxy=(config.get("proxy") or None),
+            page_bridge=page_bridge,
         )
         self.file_manager = FileManager(config.get("path") or "./Downloaded")
         retry_times = int(config.get("retry_times") or 3)

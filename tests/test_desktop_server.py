@@ -229,3 +229,73 @@ def test_native_bridge_hides_window_from_pywebview_introspection():
     assert all(callable(getattr(bridge, name)) for name in public_attrs)
     assert bridge._run_on_ui_thread(lambda: "ok") == "ok"
 
+
+def test_desktop_page_bridge_query_sanitization_and_wiring(tmp_path):
+    import asyncio
+    from auth import CookieManager
+    from config import ConfigLoader
+    from core import DouyinAPIClient
+    from core.preview_service import PreviewService
+    from desktop_server.page_bridge import DesktopPageBridge, PageBridgeResponse
+    from desktop_server.state import DesktopRuntime
+
+    url = DesktopPageBridge.build_request_url(
+        "/aweme/v1/web/aweme/detail/",
+        {
+            "aweme_id": "7712005420173470331",
+            "aid": "6383",
+            "uifid": "",
+            "msToken": "",
+            "a_bogus": "stale_ab",
+            "X-Bogus": "stale_xb",
+        },
+    )
+    assert "aweme_id=7712005420173470331" in url
+    assert "aid=6383" in url
+    assert "uifid" not in url
+    assert "msToken" not in url
+    assert "a_bogus" not in url
+    assert "X-Bogus" not in url
+
+    class FakeBridge:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch(self, path, params, *, method="GET", data=None):
+            self.calls.append((path, dict(params), method))
+            return PageBridgeResponse(
+                http_status=200,
+                body={
+                    "status_code": 0,
+                    "aweme_detail": {
+                        "aweme_id": "7712005420173470331",
+                        "aweme_type": 68,
+                        "desc": "测试实况图集",
+                    },
+                },
+            )
+
+    async def _run():
+        cfg = ConfigLoader(None)
+        cfg.config["path"] = str(tmp_path)
+        cm = CookieManager(str(tmp_path / ".cookies.json"))
+        fake_bridge = FakeBridge()
+        service = PreviewService(cfg, cm, page_bridge=fake_bridge)
+        try:
+            assert service.api_client.page_bridge is fake_bridge
+            detail = await service.api_client.get_video_detail("7712005420173470331")
+            assert detail is not None
+            assert detail["aweme_id"] == "7712005420173470331"
+            assert fake_bridge.calls and fake_bridge.calls[0][0] == "/aweme/v1/web/aweme/detail/"
+        finally:
+            await service.close()
+
+        runtime = DesktopRuntime(tmp_path)
+        runtime.page_bridge._applied_cookie_fingerprint = (("k", "v"),)
+        runtime.save_cookie_string("sessionid=abc; odin_tt=xyz")
+        assert runtime.page_bridge._applied_cookie_fingerprint is None
+        await runtime.page_bridge.close()
+
+    asyncio.run(_run())
+
+
