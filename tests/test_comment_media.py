@@ -157,7 +157,12 @@ async def test_download_image_failure_returns_none(tmp_path):
 
 @pytest.mark.asyncio
 async def test_download_live_photo_merges(tmp_path):
-    from core.live_photo import LIVE_MERGED_DIR_NAME, LIVE_RAW_DIR_NAME
+    from core.live_photo import (
+        LIVE_MERGED_DIR_NAME,
+        LIVE_RAW_DIR_NAME,
+        extract_huawei_mp4_span,
+        verify_live_photo,
+    )
 
     image = extract_comment_images(_comment_with_images())[1]
     result = await _downloader().download_live_photo(image, tmp_path, "live")
@@ -167,7 +172,10 @@ async def test_download_live_photo_merges(tmp_path):
     assert result["image"].stem == result["video"].stem == result["merged"].stem == "live"
     assert result["merged"].exists()
     data = result["merged"].read_bytes()
-    assert data.endswith(b"LIVE_000000000000004")
+    assert data.endswith(b"LIVE_24             ")
+    assert verify_live_photo(result["merged"]) == (True, "24", 4)
+    span = extract_huawei_mp4_span(data)
+    assert span is not None and data[span[0] : span[1]] == b"data"
 
 
 @pytest.mark.asyncio

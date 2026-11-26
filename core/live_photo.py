@@ -1,11 +1,10 @@
-"""Live Photo 合并工具：单文件动态照片封装（Android Motion Photo + 荣耀/华为）。
+"""Live Photo 合并工具：单文件动态照片封装（Android Motion Photo + 华为/荣耀 60B 尾标）。
 
-支持三种封装模式（默认 ``universal``）：
-- ``universal``：写入标准 EXIF ``UserComment``（OPPO/一加白名单）、Google
-  Motion Photo v1.0 + MicroVideo XMP 容器元数据（小米/vivo/三星/Google Photos
-  等安卓相册通用），并在末尾保留 20 字节 ``LIVE_`` 尾标（兼容荣耀/华为旧版解析）。
-- ``android``：纯标准 Android Motion Photo（EXIF + XMP，无 ``LIVE_`` 尾标）。
-- ``huawei``：传统荣耀/华为二进制拼接（原图 + MP4 + 20 字节 ``LIVE_`` 尾标）。
+实测 HUAWEI Mate 80 Pro (OpenHarmony 6.1) 真机动态照片二进制结构：
+``[JPEG] + [MP4 (V 字节)] + [v6_f0 (20B 空格填充)] + [0:<dur_ms> (20B 空格填充)] + [LIVE_<V+20> (20B 空格填充)]``
+其中华为相册按 ``EOF - 40 - LIVE_val`` 定位 MP4 起点、按 ``EOF - 60`` 定位 MP4 终点；
+``universal`` 模式在 JPEG 头同时注入 Google Motion Photo v1.0 / MicroVideo XMP（偏移
+设为 ``V + 60``）与 OPPO EXIF ``UserComment``，使单一文件同时对齐安卓通用相册与华为/荣耀。
 """
 
 from __future__ import annotations
@@ -28,7 +27,8 @@ DEFAULT_LIVE_PHOTO_FORMAT = "universal"
 
 _FOOTER_PREFIX = b"LIVE_"
 _FOOTER_LENGTH = 20
-_SIZE_DIGITS = _FOOTER_LENGTH - len(_FOOTER_PREFIX)
+_HUAWEI_TRAILER_LENGTH = 60
+_V_TAG_RE = re.compile(rb"^v\d+_f\d+\s*$")
 
 _XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
 _EXIF_HEADER = b"Exif\x00\x00"
@@ -51,26 +51,124 @@ def normalize_live_photo_format(mode: Optional[str]) -> str:
     return DEFAULT_LIVE_PHOTO_FORMAT
 
 
+def _read_mp4_duration_ms(video_bytes: bytes) -> int:
+    """从 MP4 ``moov -> mvhd`` 中解析视频总时长（毫秒）；异常或截断时返回 0。"""
+    n = len(video_bytes)
+    pos = 0
+    moov_span: Optional[Tuple[int, int]] = None
+    while pos + 8 <= n:
+        box_size, box_type = struct.unpack(">I4s", video_bytes[pos : pos + 8])
+        header_len = 8
+        if box_size == 1:
+            if pos + 16 > n:
+                return 0
+            box_size = struct.unpack(">Q", video_bytes[pos + 8 : pos + 16])[0]
+            header_len = 16
+        elif box_size == 0:
+            box_size = n - pos
+        if box_size < header_len or pos + box_size > n:
+            return 0
+        if box_type == b"moov":
+            moov_span = (pos + header_len, pos + box_size)
+            break
+        pos += box_size
+
+    if moov_span is None:
+        return 0
+
+    mpos, mend = moov_span
+    while mpos + 8 <= mend:
+        box_size, box_type = struct.unpack(">I4s", video_bytes[mpos : mpos + 8])
+        header_len = 8
+        if box_size == 1:
+            if mpos + 16 > mend:
+                return 0
+            box_size = struct.unpack(">Q", video_bytes[mpos + 8 : mpos + 16])[0]
+            header_len = 16
+        elif box_size == 0:
+            box_size = mend - mpos
+        if box_size < header_len or mpos + box_size > mend:
+            return 0
+        if box_type == b"mvhd":
+            payload_start = mpos + header_len
+            if payload_start + 20 > mpos + box_size:
+                return 0
+            version = video_bytes[payload_start]
+            if version == 0:
+                timescale, duration = struct.unpack(
+                    ">II", video_bytes[payload_start + 12 : payload_start + 20]
+                )
+            elif version == 1:
+                if payload_start + 32 > mpos + box_size:
+                    return 0
+                timescale, duration = struct.unpack(
+                    ">IQ", video_bytes[payload_start + 20 : payload_start + 32]
+                )
+            else:
+                return 0
+            if timescale <= 0 or duration <= 0:
+                return 0
+            return int(round(duration * 1000.0 / timescale))
+        mpos += box_size
+    return 0
+
+
 def build_footer(video_size: int) -> bytes:
-    """构造尾部 20 字节：``LIVE_`` + 15 位十进制视频长度。"""
+    """构造尾部 20 字节：``LIVE_<长度>`` 左对齐并以 ASCII 空格右填充至 20 字节。"""
     if video_size < 0:
         raise ValueError("video_size must be non-negative")
-    return _FOOTER_PREFIX + f"{int(video_size):0{_SIZE_DIGITS}d}".encode("ascii")
+    text = f"LIVE_{int(video_size)}"
+    if len(text) > _FOOTER_LENGTH:
+        raise ValueError("video_size too large for 20-byte LIVE_ footer")
+    return text.ljust(_FOOTER_LENGTH).encode("ascii")
+
+
+def build_huawei_trailer(
+    video_size: int,
+    *,
+    duration_ms: int = 0,
+    cover_frame: int = 0,
+) -> bytes:
+    """构造 60 字节华为/荣耀动态照片尾标（3 × 20 字节左对齐空格填充）。"""
+    if video_size < 0:
+        raise ValueError("video_size must be non-negative")
+    block1 = f"v6_f{max(0, int(cover_frame))}".ljust(_FOOTER_LENGTH)[:_FOOTER_LENGTH].encode("ascii")
+    block2 = f"0:{max(0, int(duration_ms))}".ljust(_FOOTER_LENGTH)[:_FOOTER_LENGTH].encode("ascii")
+    block3 = build_footer(int(video_size) + _FOOTER_LENGTH)
+    return block1 + block2 + block3
 
 
 def parse_footer(data: bytes) -> Optional[Tuple[str, int]]:
-    """解析文件末尾 20 字节；非 ``LIVE_`` 格式时返回 None。"""
+    """解析文件末尾 20 字节 ``LIVE_`` 字段（兼容空格填充与旧版零填充）；非 ``LIVE_`` 时返回 None。"""
     if not data or len(data) < _FOOTER_LENGTH:
         return None
     footer = data[-_FOOTER_LENGTH:]
     if not footer.startswith(_FOOTER_PREFIX):
         return None
-    size_text = footer[len(_FOOTER_PREFIX) :].decode("ascii", errors="replace")
-    try:
-        video_size = int(size_text)
-    except ValueError:
+    size_text = footer[len(_FOOTER_PREFIX) :].rstrip(b" ").decode("ascii", errors="replace")
+    if not size_text or not size_text.isdigit():
         return None
-    return size_text, video_size
+    return size_text, int(size_text)
+
+
+def extract_huawei_mp4_span(data: bytes) -> Optional[Tuple[int, int]]:
+    """根据华为/荣耀尾标推算内嵌 MP4 的 ``(start, end)`` 字节区间（支持 60B/40B/20B）。"""
+    parsed = parse_footer(data)
+    if parsed is None:
+        return None
+    _size_text, live_val = parsed
+    n = len(data)
+    if n >= 60 and _V_TAG_RE.match(data[-60:-40]) and live_val > 20:
+        start = n - 40 - live_val
+        end = n - 60
+        return (start, end) if 0 < start < end else None
+    if n >= 40 and b":" in data[-40:-20]:
+        start = n - 40 - live_val
+        end = n - 40
+        return (start, end) if 0 < start < end else None
+    start = n - 20 - live_val
+    end = n - 20
+    return (start, end) if 0 < start < end else None
 
 
 def build_motion_photo_xmp(video_offset: int, *, include_oplus: bool = True) -> bytes:
@@ -265,17 +363,18 @@ def merge_live_photo_bytes(
         raise ValueError("video_bytes is empty")
 
     mode = normalize_live_photo_format(format_mode)
-    if mode == "huawei":
-        return image_bytes + video_bytes + build_footer(len(video_bytes))
-
     if mode == "android":
         enriched = inject_motion_photo_metadata(image_bytes, len(video_bytes), include_oplus=True)
         return enriched + video_bytes
 
-    footer = build_footer(len(video_bytes))
-    video_offset = len(video_bytes) + len(footer)
-    enriched = inject_motion_photo_metadata(image_bytes, video_offset, include_oplus=True)
-    return enriched + video_bytes + footer
+    duration_ms = _read_mp4_duration_ms(video_bytes)
+    trailer = build_huawei_trailer(len(video_bytes), duration_ms=duration_ms)
+    if mode == "huawei":
+        return image_bytes + video_bytes + trailer
+
+    xmp_offset = len(video_bytes) + len(trailer)
+    enriched = inject_motion_photo_metadata(image_bytes, xmp_offset, include_oplus=True)
+    return enriched + video_bytes + trailer
 
 
 def merge_live_photo_files(
@@ -320,7 +419,7 @@ def merge_live_photo_files(
 
 
 def verify_live_photo(path: Path) -> Tuple[bool, Optional[str], Optional[int]]:
-    """校验动态照片格式（``LIVE_`` 尾标或 XMP Motion Photo 偏移）；返回 (ok, tag, size)。"""
+    """校验动态照片格式（``LIVE_`` 尾标或 XMP Motion Photo 偏移）；返回 (ok, tag, mp4_size)。"""
     try:
         data = path.read_bytes()
     except Exception as exc:  # noqa: BLE001
@@ -328,10 +427,11 @@ def verify_live_photo(path: Path) -> Tuple[bool, Optional[str], Optional[int]]:
         return False, None, None
     parsed = parse_footer(data)
     if parsed is not None:
-        footer, video_size = parsed
-        if video_size > len(data) - _FOOTER_LENGTH:
-            return False, footer, video_size
-        return True, footer, video_size
+        footer_text, live_val = parsed
+        span = extract_huawei_mp4_span(data)
+        if span is not None:
+            return True, footer_text, span[1] - span[0]
+        return False, footer_text, live_val
 
     motion_offset = parse_motion_photo_offset(data)
     if motion_offset is not None and 0 < motion_offset < len(data):
@@ -359,12 +459,12 @@ def _convert_to_jpeg(data: bytes) -> Optional[bytes]:
 
 
 def read_video_size_from_footer(path: Path) -> Optional[int]:
-    """读取尾部声明的视频长度或 XMP MotionPhoto 偏移量。"""
+    """读取嵌入视频的字节长度（兼容华为 60B/40B/20B 尾标与 XMP MotionPhoto）。"""
     try:
         data = path.read_bytes()
     except Exception:
         return None
-    parsed = parse_footer(data)
-    if parsed:
-        return parsed[1]
+    span = extract_huawei_mp4_span(data)
+    if span is not None:
+        return span[1] - span[0]
     return parse_motion_photo_offset(data)
